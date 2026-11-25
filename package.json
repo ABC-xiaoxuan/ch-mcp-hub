@@ -1,0 +1,22 @@
+{
+  "name": "ch-mcp-hub",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ABC-xiaoxuan/ch-mcp-hub.git"
+  },
+  "description": "Unified MCP control plane extension for CodexHost (Web sidebar + Desktop page + shared Node backend)",
+  "scripts": {
+    "sync:styles": "node scripts/pack.mjs --styles-only",
+    "icon": "node scripts/generate-icon.mjs",
+    "test": "node --test test/*.test.mjs",
+    "pack": "node scripts/pack.mjs",
+    "verify": "node scripts/pack.mjs --verify-only"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
