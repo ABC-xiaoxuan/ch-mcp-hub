@@ -80,6 +80,16 @@ const SVG_PATHS = {
   spark: [
     '<path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8" />',
   ],
+  code: [
+    '<path d="m8 9-4 3 4 3M16 9l4 3-4 3M13.5 6l-3 12" />',
+  ],
+  layers: [
+    '<path d="m12 3 9 4.5-9 4.5-9-4.5L12 3Z" />',
+    '<path d="m3 12 9 4.5 9-4.5M3 16.5 12 21l9-4.5" />',
+  ],
+  bolt: [
+    '<path d="M13 2 4.5 13.5H12L11 22l8.5-11.5H12L13 2Z" />',
+  ],
 };
 
 export function iconSvg(name, size = 15) {

@@ -1,18 +1,19 @@
 /**
- * Four-harness native MCP configuration adapters with atomic writes, automatic backups,
- * cross-harness schema conversion, and lossless Claude Code disable stashing.
+ * High-performance four-harness native MCP & plugin configuration engine.
  *
- * Supported harnesses:
- * - `claude-code`: `~/.claude.json` (`mcpServers`)
- * - `antigravity`: `~/.gemini/config/mcp_config.json` (`mcpServers`)
- * - `opencode`: `~/.config/opencode/opencode.json` (fallback `~/.opencode/opencode.json`) (`mcp`)
- * - `codex`: `~/.codex/config.toml` (`[mcp_servers.<name>]`)
+ * Performance & reliability design:
+ * - `stat()` `(mtimeMs, size)` cache per config file: warm reads do 0 disk reads and 0 JSON/TOML parses.
+ * - Separated backup index (`backups/index.json`) & raw payloads (`backups/<id>.dat`):
+ *   listing backups never loads full config snapshots into memory.
+ * - Per-harness serialized write queue: concurrent pill clicks never race or corrupt configs.
+ * - Lossless preservation: unknown JSON keys and Codex TOML comments/sections stay intact.
+ * - Discovers Global MCPs, Claude project-scoped MCPs, and Antigravity/Claude native plugins.
  */
 
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { parseCodexMcpToml, patchCodexMcpToml } from "./toml.mjs";
+import { parseCodexMcpToml, patchCodexMcpToml, renderCodexMcpServerBlock } from "./toml.mjs";
 
 export const HARNESS_IDS = ["claude-code", "antigravity", "opencode", "codex"];
 
@@ -107,7 +108,8 @@ function normalizeStringArray(arr) {
 
 export function normalizeServerInput(input) {
   const name = validateServerName(input?.name);
-  const transport = input?.transport === "http" || input?.transport === "sse" ? input.transport : "stdio";
+  const transport =
+    input?.transport === "http" || input?.transport === "sse" ? input.transport : "stdio";
   const enabled = input?.enabled !== false;
 
   if (transport === "http" || transport === "sse") {
@@ -122,15 +124,16 @@ export function normalizeServerInput(input) {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       throw new Error("Remote MCP URL must use http:// or https://");
     }
+    const bearer =
+      typeof input?.bearerTokenEnvVar === "string" && input.bearerTokenEnvVar.trim()
+        ? input.bearerTokenEnvVar.trim()
+        : null;
     return {
       name,
       transport,
       url: parsed.href,
       headers: normalizeStringMap(input?.headers),
-      bearerTokenEnvVar:
-        typeof input?.bearerTokenEnvVar === "string" && input.bearerTokenEnvVar.trim()
-          ? input.bearerTokenEnvVar.trim()
-          : undefined,
+      ...(bearer ? { bearerTokenEnvVar: bearer } : {}),
       enabled,
     };
   }
@@ -195,7 +198,6 @@ function stripJsonComments(raw) {
     }
     out += ch;
   }
-  // Remove trailing commas before } or ].
   return out.replace(/,\s*([}\]])/gu, "$1");
 }
 
@@ -207,9 +209,9 @@ function parseJsonFlexible(raw) {
   }
 }
 
-async function fileExists(filePath) {
+async function pathExists(filePath) {
   try {
-    await readFile(filePath, "utf8");
+    await stat(filePath);
     return true;
   } catch {
     return false;
@@ -223,7 +225,6 @@ async function atomicWriteUtf8(filePath, content) {
   try {
     await rename(tmpPath, filePath);
   } catch (error) {
-    // Windows can occasionally throw EPERM/EBUSY on atomic replace if another reader has a handle.
     if (error && (error.code === "EPERM" || error.code === "EBUSY" || error.code === "EXDEV")) {
       await writeFile(filePath, content, "utf8");
       await unlink(tmpPath).catch(() => {});
@@ -243,9 +244,6 @@ function resolveTilde(p, homeDir) {
   return p;
 }
 
-/**
- * Resolve each harness's native config file path, honoring optional user overrides.
- */
 export async function resolveHarnessConfigPaths({ homeDir = os.homedir(), overrides = {} } = {}) {
   const claude = overrides.claudeConfigPath
     ? resolveTilde(String(overrides.claudeConfigPath).trim(), homeDir)
@@ -264,13 +262,9 @@ export async function resolveHarnessConfigPaths({ homeDir = os.homedir(), overri
       path.join(homeDir, ".config", "opencode", "opencode.jsonc"),
       path.join(homeDir, ".opencode", "opencode.json"),
     ];
-    opencode = candidates[0];
-    for (const candidate of candidates) {
-      if (await fileExists(candidate)) {
-        opencode = candidate;
-        break;
-      }
-    }
+    const checks = await Promise.all(candidates.map((c) => pathExists(c)));
+    const foundIdx = checks.findIndex(Boolean);
+    opencode = foundIdx >= 0 ? candidates[foundIdx] : candidates[0];
   }
 
   const codex = overrides.codexConfigPath
@@ -286,7 +280,7 @@ export async function resolveHarnessConfigPaths({ homeDir = os.homedir(), overri
 }
 
 // ---------------------------------------------------------------------------
-// Per-harness normalization (Native <-> Canonical)
+// Per-harness codecs (Native <-> Canonical)
 // ---------------------------------------------------------------------------
 
 function decodeClaudeEntry(name, raw) {
@@ -379,7 +373,6 @@ function encodeAntigravityEntry(server, previousRaw = {}) {
   const disabledField = server.enabled === false ? { disabled: true } : {};
 
   if (server.transport === "http" || server.transport === "sse") {
-    // Preserve `serverUrl` only if the existing entry exclusively used `serverUrl`; otherwise emit `url`.
     const useLegacyServerUrl =
       Object.hasOwn(previousRaw, "serverUrl") && !Object.hasOwn(previousRaw, "url");
     return {
@@ -469,8 +462,9 @@ function decodeCodexEntry(name, raw) {
       transport: raw.type === "sse" ? "sse" : "http",
       url,
       headers: normalizeStringMap(raw.http_headers ?? raw.headers),
-      bearerTokenEnvVar:
-        typeof raw.bearer_token_env_var === "string" ? raw.bearer_token_env_var : undefined,
+      ...(typeof raw.bearer_token_env_var === "string" && raw.bearer_token_env_var
+        ? { bearerTokenEnvVar: raw.bearer_token_env_var }
+        : {}),
       enabled,
     };
   }
@@ -514,31 +508,250 @@ function encodeCodexEntry(server, previousRaw = {}) {
   };
 }
 
+/**
+ * Preview exact serialized native configuration snippets for each target harness
+ * without touching disk.
+ */
+export function renderNativePreviews(serverInput, targets = HARNESS_IDS) {
+  const server = normalizeServerInput(serverInput);
+  const validTargets = (Array.isArray(targets) ? targets : HARNESS_IDS).filter((id) =>
+    HARNESS_IDS.includes(id),
+  );
+  const previews = {};
+  for (const hid of validTargets) {
+    if (hid === "claude-code") {
+      previews[hid] = {
+        format: "json",
+        snippet: JSON.stringify({ mcpServers: { [server.name]: encodeClaudeEntry(server) } }, null, 2),
+      };
+    } else if (hid === "antigravity") {
+      previews[hid] = {
+        format: "json",
+        snippet: JSON.stringify(
+          { mcpServers: { [server.name]: encodeAntigravityEntry(server) } },
+          null,
+          2,
+        ),
+      };
+    } else if (hid === "opencode") {
+      previews[hid] = {
+        format: "json",
+        snippet: JSON.stringify({ mcp: { [server.name]: encodeOpenCodeEntry(server) } }, null, 2),
+      };
+    } else if (hid === "codex") {
+      previews[hid] = {
+        format: "toml",
+        snippet: renderCodexMcpServerBlock(server.name, encodeCodexEntry(server)),
+      };
+    }
+  }
+  return previews;
+}
+
+/**
+ * Compute structured field-level differences across harnesses for one MCP server.
+ */
+export function computeServerDrift(instances) {
+  const entries = Object.entries(instances);
+  if (entries.length <= 1) return { hasDrift: false, fields: [] };
+
+  const fields = [];
+  const checkField = (field, getter) => {
+    const byHarness = {};
+    const distinct = new Set();
+    for (const [hid, inst] of entries) {
+      const val = getter(inst);
+      byHarness[hid] = val;
+      distinct.add(JSON.stringify(val));
+    }
+    if (distinct.size > 1) {
+      fields.push({ field, values: byHarness });
+    }
+  };
+
+  checkField("transport", (e) => e.transport);
+  checkField("url", (e) => e.url ?? "");
+  checkField("command", (e) => e.command ?? "");
+  checkField("args", (e) => e.args ?? []);
+  checkField("headers", (e) => Object.keys(e.headers ?? {}).sort());
+  checkField("env", (e) => Object.keys(e.env ?? {}).sort());
+
+  return { hasDrift: fields.length > 0, fields };
+}
+
 // ---------------------------------------------------------------------------
-// Backup & Claude Stash store (in ctx.dataDir)
+// Projected stat-cached file reader:
+// - Stores ONLY the small projected result (drops giant raw text & unused JSON subtrees
+//   like Claude project histories so RAM stays tiny even with multi-MB configs).
+// - Zero disk reads and zero JSON/TOML parses when (mtimeMs, size) is unchanged.
+// ---------------------------------------------------------------------------
+
+class StatFileCache {
+  #entries = new Map();
+
+  async readParsed(filePath, projector) {
+    let info;
+    try {
+      info = await stat(filePath);
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        this.#entries.delete(filePath);
+        return { exists: false, parsed: null, parseError: null, cacheHit: false, sig: "missing" };
+      }
+      return {
+        exists: true,
+        parsed: null,
+        parseError: error instanceof Error ? error.message : String(error),
+        cacheHit: false,
+        sig: `err:${Date.now()}`,
+      };
+    }
+
+    const sig = `${info.mtimeMs}:${info.size}`;
+    const cached = this.#entries.get(filePath);
+    if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
+      return {
+        exists: true,
+        parsed: cached.parsed,
+        parseError: cached.parseError,
+        cacheHit: true,
+        sig,
+      };
+    }
+
+    let raw;
+    try {
+      raw = await readFile(filePath, "utf8");
+    } catch (error) {
+      return {
+        exists: true,
+        parsed: null,
+        parseError: error instanceof Error ? error.message : String(error),
+        cacheHit: false,
+        sig: `readerr:${Date.now()}`,
+      };
+    }
+
+    let parsed = null;
+    let parseError = null;
+    try {
+      parsed = projector(raw);
+    } catch (error) {
+      parseError = error instanceof Error ? error.message : String(error);
+    }
+
+    this.#entries.set(filePath, {
+      mtimeMs: info.mtimeMs,
+      size: info.size,
+      parsed,
+      parseError,
+    });
+
+    return { exists: true, parsed, parseError, cacheHit: false, sig };
+  }
+
+  invalidate(filePath) {
+    this.#entries.delete(filePath);
+  }
+
+  clear() {
+    this.#entries.clear();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main McpConfigStore
 // ---------------------------------------------------------------------------
 
 export class McpConfigStore {
+  #fileCache = new StatFileCache();
+  #writeQueues = new Map();
+  #backupIndexCache = null;
+  #backupVersion = 0;
+  #overviewMemo = null; // { sig, payload }
+
   constructor({ dataDir, homeDir = os.homedir(), getOverrides = async () => ({}) }) {
     this.dataDir = dataDir;
     this.homeDir = homeDir;
     this.getOverrides = getOverrides;
     this.backupsDir = path.join(dataDir, "backups");
+    this.backupIndexPath = path.join(this.backupsDir, "index.json");
     this.stashPath = path.join(dataDir, "claude-disabled-stash.json");
   }
 
+  #enqueue(key, task) {
+    const prev = this.#writeQueues.get(key) ?? Promise.resolve();
+    const next = prev.then(task, task);
+    const cleanup = next.finally(() => {
+      if (this.#writeQueues.get(key) === cleanup) {
+        this.#writeQueues.delete(key);
+      }
+    });
+    this.#writeQueues.set(key, cleanup);
+    return next;
+  }
+
   async #readStash() {
-    try {
-      const raw = await readFile(this.stashPath, "utf8");
-      const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-    } catch {
+    const res = await this.#fileCache.readParsed(this.stashPath, (raw) =>
+      raw.trim() ? JSON.parse(raw) : {},
+    );
+    if (!res.exists || res.parseError || !res.parsed || typeof res.parsed !== "object" || Array.isArray(res.parsed)) {
       return {};
     }
+    return { ...res.parsed };
   }
 
   async #writeStash(stash) {
     await atomicWriteUtf8(this.stashPath, JSON.stringify(stash, null, 2) + "\n");
+    this.#fileCache.invalidate(this.stashPath);
+  }
+
+  // Separated lightweight backup index (`backups/index.json`) + raw payload (`backups/<id>.dat`).
+  async #loadBackupIndex() {
+    if (this.#backupIndexCache !== null) return this.#backupIndexCache;
+    try {
+      const raw = await readFile(this.backupIndexPath, "utf8");
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        this.#backupIndexCache = parsed;
+        return parsed;
+      }
+    } catch {
+      // Fall back to migrating any legacy v1.0.0 `*.json` backup files once.
+    }
+
+    const migrated = [];
+    try {
+      const entries = (await readdir(this.backupsDir))
+        .filter((name) => name.endsWith(".json") && name !== "index.json")
+        .sort()
+        .reverse();
+      for (const file of entries.slice(0, MAX_BACKUPS)) {
+        try {
+          const full = JSON.parse(await readFile(path.join(this.backupsDir, file), "utf8"));
+          if (!full?.id || typeof full.content !== "string") continue;
+          await atomicWriteUtf8(path.join(this.backupsDir, `${full.id}.dat`), full.content);
+          migrated.push({
+            id: full.id,
+            harnessId: full.harnessId,
+            configPath: full.configPath,
+            reason: full.reason,
+            createdAt: full.createdAt,
+            sizeBytes: full.sizeBytes ?? Buffer.byteLength(full.content, "utf8"),
+          });
+          await unlink(path.join(this.backupsDir, file)).catch(() => {});
+        } catch {
+          // Ignore corrupted legacy backup.
+        }
+      }
+      if (migrated.length > 0) {
+        await atomicWriteUtf8(this.backupIndexPath, JSON.stringify(migrated, null, 2) + "\n");
+      }
+    } catch {
+      // backupsDir doesn't exist yet.
+    }
+    this.#backupIndexCache = migrated;
+    return migrated;
   }
 
   async #createBackup(harnessId, configPath, originalRaw, reason) {
@@ -546,7 +759,8 @@ export class McpConfigStore {
     await mkdir(this.backupsDir, { recursive: true });
     const now = new Date();
     const stamp = now.toISOString().replace(/[:.]/gu, "-");
-    const id = `${stamp}_${harnessId}`;
+    const rand = Math.random().toString(36).slice(2, 6);
+    const id = `${stamp}_${rand}_${harnessId}`;
     const meta = {
       id,
       harnessId,
@@ -554,81 +768,45 @@ export class McpConfigStore {
       reason,
       createdAt: now.toISOString(),
       sizeBytes: Buffer.byteLength(originalRaw, "utf8"),
-      content: originalRaw,
     };
-    await atomicWriteUtf8(path.join(this.backupsDir, `${id}.json`), JSON.stringify(meta));
-    await this.#pruneBackups();
-    return {
-      id: meta.id,
-      harnessId: meta.harnessId,
-      configPath: meta.configPath,
-      reason: meta.reason,
-      createdAt: meta.createdAt,
-      sizeBytes: meta.sizeBytes,
-    };
-  }
 
-  async #pruneBackups() {
-    try {
-      const entries = (await readdir(this.backupsDir))
-        .filter((name) => name.endsWith(".json"))
-        .sort();
-      if (entries.length <= MAX_BACKUPS) return;
-      const toDelete = entries.slice(0, entries.length - MAX_BACKUPS);
-      for (const file of toDelete) {
-        await unlink(path.join(this.backupsDir, file)).catch(() => {});
-      }
-    } catch {
-      // Non-fatal backup pruning error.
+    await atomicWriteUtf8(path.join(this.backupsDir, `${id}.dat`), originalRaw);
+    const index = [meta, ...(await this.#loadBackupIndex())];
+    const removed = index.splice(MAX_BACKUPS);
+    this.#backupIndexCache = index;
+    this.#backupVersion += 1;
+    this.#overviewMemo = null;
+    await atomicWriteUtf8(this.backupIndexPath, JSON.stringify(index, null, 2) + "\n");
+    for (const old of removed) {
+      await unlink(path.join(this.backupsDir, `${old.id}.dat`)).catch(() => {});
     }
+    return meta;
   }
 
   async listBackups() {
-    try {
-      const entries = (await readdir(this.backupsDir))
-        .filter((name) => name.endsWith(".json"))
-        .sort()
-        .reverse();
-      const result = [];
-      for (const file of entries.slice(0, MAX_BACKUPS)) {
-        try {
-          const parsed = JSON.parse(await readFile(path.join(this.backupsDir, file), "utf8"));
-          result.push({
-            id: parsed.id,
-            harnessId: parsed.harnessId,
-            configPath: parsed.configPath,
-            reason: parsed.reason,
-            createdAt: parsed.createdAt,
-            sizeBytes: parsed.sizeBytes,
-          });
-        } catch {
-          // Skip malformed backup file.
-        }
-      }
-      return result;
-    } catch {
-      return [];
-    }
+    const index = await this.#loadBackupIndex();
+    return [...index];
   }
 
   async restoreBackup(backupId) {
     if (!/^[A-Za-z0-9_.-]+$/u.test(String(backupId ?? ""))) {
       throw new Error("Invalid backup ID");
     }
-    const filePath = path.join(this.backupsDir, `${backupId}.json`);
-    const backup = JSON.parse(await readFile(filePath, "utf8"));
-    const paths = await this.#resolvePaths();
-    const targetPath = paths[backup.harnessId];
-    if (!targetPath) {
-      throw new Error(`Unknown harness in backup: ${backup.harnessId}`);
-    }
-    // Snapshot current file before restoring so restore itself is reversible!
-    const currentRaw = await readFile(targetPath, "utf8").catch(() => null);
-    if (currentRaw !== null) {
-      await this.#createBackup(backup.harnessId, targetPath, currentRaw, `pre-restore:${backupId}`);
-    }
-    await atomicWriteUtf8(targetPath, backup.content);
-    return { restored: true, harnessId: backup.harnessId, configPath: targetPath };
+    const index = await this.#loadBackupIndex();
+    const meta = index.find((item) => item.id === backupId);
+    if (!meta) throw new Error(`Backup snapshot "${backupId}" not found`);
+
+    const content = await readFile(path.join(this.backupsDir, `${backupId}.dat`), "utf8");
+    const targetPath = meta.configPath;
+    return this.#enqueue(meta.harnessId, async () => {
+      const currentRaw = await readFile(targetPath, "utf8").catch(() => null);
+      if (currentRaw !== null) {
+        await this.#createBackup(meta.harnessId, targetPath, currentRaw, `pre-restore:${backupId}`);
+      }
+      await atomicWriteUtf8(targetPath, content);
+      this.#fileCache.invalidate(targetPath);
+      return { restored: true, harnessId: meta.harnessId, configPath: targetPath };
+    });
   }
 
   async #resolvePaths() {
@@ -636,67 +814,68 @@ export class McpConfigStore {
     return resolveHarnessConfigPaths({ homeDir: this.homeDir, overrides });
   }
 
-  async readHarness(harnessId) {
-    const paths = await this.#resolvePaths();
+  async readHarness(harnessId, preResolvedPaths = null) {
+    const paths = preResolvedPaths ?? (await this.#resolvePaths());
     const configPath = paths[harnessId];
     if (!configPath) throw new Error(`Unsupported harness: ${harnessId}`);
 
-    let raw = null;
-    try {
-      raw = await readFile(configPath, "utf8");
-    } catch (error) {
-      if (error && error.code === "ENOENT") {
-        const stashed = harnessId === "claude-code" ? await this.#readStash() : {};
+    if (harnessId === "codex") {
+      const file = await this.#fileCache.readParsed(configPath, (raw) => {
+        const parsed = parseCodexMcpToml(raw);
         const servers = {};
-        for (const [name, entry] of Object.entries(stashed)) {
-          const decoded = decodeClaudeEntry(name, entry);
-          if (decoded) servers[name] = { ...decoded, enabled: false };
+        for (const [name, entry] of Object.entries(parsed.servers ?? {})) {
+          const decoded = decodeCodexEntry(name, entry);
+          if (decoded) servers[name] = decoded;
         }
-        return {
-          harnessId,
-          configPath,
-          exists: false,
-          parseError: null,
-          servers,
-        };
+        return servers;
+      });
+      if (!file.exists) {
+        return { harnessId, configPath, exists: false, parseError: null, servers: {}, cacheHit: false, sig: `codex:${configPath}:missing` };
+      }
+      if (file.parseError) {
+        return { harnessId, configPath, exists: true, parseError: file.parseError, servers: {}, cacheHit: file.cacheHit, sig: `codex:${configPath}:${file.sig}` };
       }
       return {
         harnessId,
         configPath,
         exists: true,
-        parseError: error instanceof Error ? error.message : String(error),
-        servers: {},
+        parseError: null,
+        servers: file.parsed ?? {},
+        cacheHit: file.cacheHit,
+        sig: `codex:${configPath}:${file.sig}`,
       };
     }
 
-    try {
-      if (harnessId === "codex") {
-        const parsed = parseCodexMcpToml(raw);
-        const servers = {};
-        for (const [name, entry] of Object.entries(parsed.servers)) {
-          const decoded = decodeCodexEntry(name, entry);
-          if (decoded) servers[name] = decoded;
-        }
-        return { harnessId, configPath, exists: true, parseError: null, servers };
-      }
-
+    // Project ONLY the MCP entries into cache (drops multi-MB unrelated fields like Claude project histories).
+    const file = await this.#fileCache.readParsed(configPath, (raw) => {
       const doc = raw.trim() ? parseJsonFlexible(raw) : {};
       if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
         throw new Error("Config root must be a JSON object");
       }
-
       const servers = {};
+      const projectServers = [];
       if (harnessId === "claude-code") {
         const map = doc.mcpServers && typeof doc.mcpServers === "object" ? doc.mcpServers : {};
         for (const [name, entry] of Object.entries(map)) {
           const decoded = decodeClaudeEntry(name, entry);
           if (decoded) servers[name] = decoded;
         }
-        const stashed = await this.#readStash();
-        for (const [name, entry] of Object.entries(stashed)) {
-          if (Object.hasOwn(servers, name)) continue;
-          const decoded = decodeClaudeEntry(name, entry);
-          if (decoded) servers[name] = { ...decoded, enabled: false };
+        if (doc.projects && typeof doc.projects === "object") {
+          for (const [projectPath, projCfg] of Object.entries(doc.projects)) {
+            const pMap = projCfg?.mcpServers;
+            if (!pMap || typeof pMap !== "object") continue;
+            for (const [name, entry] of Object.entries(pMap)) {
+              const decoded = decodeClaudeEntry(name, entry);
+              if (decoded) {
+                projectServers.push({
+                  ...decoded,
+                  harnessId: "claude-code",
+                  scope: "project",
+                  scopeLabel: projectPath,
+                });
+              }
+            }
+          }
         }
       } else if (harnessId === "antigravity") {
         const map = doc.mcpServers && typeof doc.mcpServers === "object" ? doc.mcpServers : {};
@@ -711,17 +890,222 @@ export class McpConfigStore {
           if (decoded) servers[name] = decoded;
         }
       }
+      return { servers, projectServers };
+    });
 
-      return { harnessId, configPath, exists: true, parseError: null, servers };
-    } catch (error) {
+    if (!file.exists) {
+      const servers = {};
+      let stashSig = "";
+      if (harnessId === "claude-code") {
+        const stashRes = await this.#fileCache.readParsed(this.stashPath, (raw) =>
+          raw.trim() ? JSON.parse(raw) : {},
+        );
+        stashSig = stashRes.sig;
+        const stashed =
+          stashRes.exists && !stashRes.parseError && stashRes.parsed && typeof stashRes.parsed === "object"
+            ? stashRes.parsed
+            : {};
+        for (const [name, entry] of Object.entries(stashed)) {
+          const decoded = decodeClaudeEntry(name, entry);
+          if (decoded) servers[name] = { ...decoded, enabled: false };
+        }
+      }
+      return {
+        harnessId,
+        configPath,
+        exists: false,
+        parseError: null,
+        servers,
+        projectServers: [],
+        cacheHit: false,
+        sig: `${harnessId}:${configPath}:missing:${stashSig}`,
+      };
+    }
+
+    if (file.parseError) {
       return {
         harnessId,
         configPath,
         exists: true,
-        parseError: error instanceof Error ? error.message : String(error),
+        parseError: file.parseError,
         servers: {},
+        projectServers: [],
+        cacheHit: file.cacheHit,
+        sig: `${harnessId}:${configPath}:${file.sig}`,
       };
     }
+
+    let servers = file.parsed?.servers ?? {};
+    const projectServers = file.parsed?.projectServers ?? [];
+    let stashSig = "";
+
+    if (harnessId === "claude-code") {
+      const stashRes = await this.#fileCache.readParsed(this.stashPath, (raw) =>
+        raw.trim() ? JSON.parse(raw) : {},
+      );
+      stashSig = stashRes.sig;
+      const stashed =
+        stashRes.exists && !stashRes.parseError && stashRes.parsed && typeof stashRes.parsed === "object"
+          ? stashRes.parsed
+          : null;
+      if (stashed && Object.keys(stashed).length > 0) {
+        servers = { ...servers };
+        for (const [name, entry] of Object.entries(stashed)) {
+          if (Object.hasOwn(servers, name)) continue;
+          const decoded = decodeClaudeEntry(name, entry);
+          if (decoded) servers[name] = { ...decoded, enabled: false };
+        }
+      }
+    }
+
+    return {
+      harnessId,
+      configPath,
+      exists: true,
+      parseError: null,
+      servers,
+      projectServers,
+      cacheHit: file.cacheHit,
+      sig: `${harnessId}:${configPath}:${file.sig}:${stashSig}`,
+    };
+  }
+
+  /**
+   * Discover native plugins & plugin-bundled MCP servers for Antigravity and Claude Code
+   * (zero subprocess spawning; pure stat-cached file inspection).
+   */
+  async readNativePlugins() {
+    const plugins = [];
+    const pluginMcpServers = [];
+    const sigParts = [];
+
+    // 1. Antigravity plugins (`~/.gemini/config/plugins/<id>` + `~/.gemini/config/config.json`)
+    const agyConfigPath = path.join(this.homeDir, ".gemini", "config", "config.json");
+    const agyPluginsDir = path.join(this.homeDir, ".gemini", "config", "plugins");
+    const agyCfgRes = await this.#fileCache.readParsed(agyConfigPath, (raw) => {
+      const doc = raw.trim() ? parseJsonFlexible(raw) : {};
+      return doc?.plugins && typeof doc.plugins === "object" ? doc.plugins : {};
+    });
+    sigParts.push(`agycfg:${agyCfgRes.sig}`);
+    const agyPluginState = agyCfgRes.parsed ?? {};
+
+    try {
+      const entries = await readdir(agyPluginsDir, { withFileTypes: true });
+      const dirNames = entries.filter((d) => d.isDirectory()).map((d) => d.name).sort();
+      sigParts.push(`agydirs:${dirNames.join(",")}`);
+      await Promise.all(
+        dirNames.map(async (dirName) => {
+          const pluginDir = path.join(agyPluginsDir, dirName);
+          const [manifestRes, mcpRes] = await Promise.all([
+            this.#fileCache.readParsed(path.join(pluginDir, "plugin.json"), (raw) => {
+              const doc = JSON.parse(raw);
+              return { name: doc?.name || dirName, disabled: doc?.disabled === true };
+            }),
+            this.#fileCache.readParsed(path.join(pluginDir, "mcp_config.json"), (raw) => {
+              const doc = raw.trim() ? parseJsonFlexible(raw) : {};
+              const out = [];
+              for (const [sName, sRaw] of Object.entries(doc?.mcpServers ?? {})) {
+                const decoded = decodeAntigravityEntry(sName, sRaw);
+                if (decoded) out.push(decoded);
+              }
+              return out;
+            }),
+          ]);
+          sigParts.push(`${dirName}:${manifestRes.sig}:${mcpRes.sig}`);
+          const defaultDisabled = manifestRes.parsed?.disabled === true;
+          const override = agyPluginState[dirName];
+          const enabled =
+            typeof override?.enabled === "boolean" ? override.enabled : !defaultDisabled;
+
+          const bundledServers = [];
+          for (const decoded of mcpRes.parsed ?? []) {
+            bundledServers.push(decoded.name);
+            pluginMcpServers.push({
+              ...decoded,
+              enabled: enabled && decoded.enabled,
+              harnessId: "antigravity",
+              scope: "plugin",
+              scopeLabel: dirName,
+            });
+          }
+
+          plugins.push({
+            id: dirName,
+            name: manifestRes.parsed?.name || dirName,
+            harnessId: "antigravity",
+            enabled,
+            bundledMcps: bundledServers,
+            configPath: agyConfigPath,
+          });
+        }),
+      );
+    } catch {
+      sigParts.push("agydirs:missing");
+    }
+
+    // 2. Claude Code enabledPlugins (`~/.claude/settings.json`)
+    const claudeSettingsPath = path.join(this.homeDir, ".claude", "settings.json");
+    const claudeSettingsRes = await this.#fileCache.readParsed(claudeSettingsPath, (raw) => {
+      const doc = raw.trim() ? parseJsonFlexible(raw) : {};
+      return doc?.enabledPlugins && typeof doc.enabledPlugins === "object" && !Array.isArray(doc.enabledPlugins)
+        ? doc.enabledPlugins
+        : {};
+    });
+    sigParts.push(`claudesettings:${claudeSettingsRes.sig}`);
+    for (const [pluginKey, isEnabled] of Object.entries(claudeSettingsRes.parsed ?? {})) {
+      if (typeof isEnabled !== "boolean") continue;
+      plugins.push({
+        id: pluginKey,
+        name: pluginKey.split("@")[0] || pluginKey,
+        harnessId: "claude-code",
+        enabled: isEnabled,
+        bundledMcps: [],
+        configPath: claudeSettingsPath,
+      });
+    }
+
+    plugins.sort((a, b) => a.name.localeCompare(b.name, "en"));
+    pluginMcpServers.sort((a, b) => a.name.localeCompare(b.name, "en"));
+    return { plugins, pluginMcpServers, sig: sigParts.join("|") };
+  }
+
+  async toggleNativePlugin(harnessId, pluginId, enabled) {
+    const id = String(pluginId ?? "").trim();
+    if (!id) throw new Error("Invalid plugin ID");
+
+    if (harnessId === "antigravity") {
+      const cfgPath = path.join(this.homeDir, ".gemini", "config", "config.json");
+      return this.#enqueue("plugin:antigravity", async () => {
+        const existingRaw = await readFile(cfgPath, "utf8").catch(() => null);
+        await this.#createBackup("antigravity", cfgPath, existingRaw, `plugin-toggle:${id}`);
+        const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+        if (!doc.plugins || typeof doc.plugins !== "object" || Array.isArray(doc.plugins)) {
+          doc.plugins = {};
+        }
+        doc.plugins[id] = { ...(doc.plugins[id] ?? {}), enabled: Boolean(enabled) };
+        await atomicWriteUtf8(cfgPath, JSON.stringify(doc, null, 2) + "\n");
+        this.#fileCache.invalidate(cfgPath);
+        return { harnessId, pluginId: id, enabled: Boolean(enabled) };
+      });
+    }
+
+    if (harnessId === "claude-code") {
+      const cfgPath = path.join(this.homeDir, ".claude", "settings.json");
+      return this.#enqueue("plugin:claude-code", async () => {
+        const existingRaw = await readFile(cfgPath, "utf8").catch(() => null);
+        await this.#createBackup("claude-code", cfgPath, existingRaw, `plugin-toggle:${id}`);
+        const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+        if (!doc.enabledPlugins || typeof doc.enabledPlugins !== "object" || Array.isArray(doc.enabledPlugins)) {
+          doc.enabledPlugins = {};
+        }
+        doc.enabledPlugins[id] = Boolean(enabled);
+        await atomicWriteUtf8(cfgPath, JSON.stringify(doc, null, 2) + "\n");
+        this.#fileCache.invalidate(cfgPath);
+        return { harnessId, pluginId: id, enabled: Boolean(enabled) };
+      });
+    }
+
+    throw new Error(`Native plugin toggle is not supported for harness "${harnessId}"`);
   }
 
   async upsertServer(serverInput, targets) {
@@ -734,60 +1118,63 @@ export class McpConfigStore {
     }
 
     const paths = await this.#resolvePaths();
-    const results = [];
+    const results = await Promise.all(
+      validTargets.map((harnessId) =>
+        this.#enqueue(harnessId, async () => {
+          const configPath = paths[harnessId];
+          const existingRaw = await readFile(configPath, "utf8").catch(() => null);
+          await this.#createBackup(harnessId, configPath, existingRaw, `upsert:${server.name}`);
 
-    for (const harnessId of validTargets) {
-      const configPath = paths[harnessId];
-      const existingRaw = await readFile(configPath, "utf8").catch(() => null);
-      await this.#createBackup(harnessId, configPath, existingRaw, `upsert:${server.name}`);
-
-      if (harnessId === "codex") {
-        const content = existingRaw ?? "";
-        const parsed = parseCodexMcpToml(content);
-        const prev = parsed.servers[server.name] ?? {};
-        const encoded = encodeCodexEntry(server, prev);
-        const nextContent = patchCodexMcpToml(content, server.name, encoded);
-        await atomicWriteUtf8(configPath, nextContent);
-      } else if (harnessId === "claude-code") {
-        const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
-        if (!doc.mcpServers || typeof doc.mcpServers !== "object" || Array.isArray(doc.mcpServers)) {
-          doc.mcpServers = {};
-        }
-        const stash = await this.#readStash();
-        const prev = doc.mcpServers[server.name] ?? stash[server.name] ?? {};
-        const encoded = encodeClaudeEntry(server, prev);
-        if (server.enabled === false) {
-          delete doc.mcpServers[server.name];
-          stash[server.name] = encoded;
-          await this.#writeStash(stash);
-        } else {
-          doc.mcpServers[server.name] = encoded;
-          if (Object.hasOwn(stash, server.name)) {
-            delete stash[server.name];
-            await this.#writeStash(stash);
+          if (harnessId === "codex") {
+            const content = existingRaw ?? "";
+            const parsed = parseCodexMcpToml(content);
+            const prev = parsed.servers[server.name] ?? {};
+            const encoded = encodeCodexEntry(server, prev);
+            const nextContent = patchCodexMcpToml(content, server.name, encoded);
+            await atomicWriteUtf8(configPath, nextContent);
+          } else if (harnessId === "claude-code") {
+            const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+            if (!doc.mcpServers || typeof doc.mcpServers !== "object" || Array.isArray(doc.mcpServers)) {
+              doc.mcpServers = {};
+            }
+            const stash = await this.#readStash();
+            const prev = doc.mcpServers[server.name] ?? stash[server.name] ?? {};
+            const encoded = encodeClaudeEntry(server, prev);
+            if (server.enabled === false) {
+              delete doc.mcpServers[server.name];
+              stash[server.name] = encoded;
+              await this.#writeStash(stash);
+            } else {
+              doc.mcpServers[server.name] = encoded;
+              if (Object.hasOwn(stash, server.name)) {
+                delete stash[server.name];
+                await this.#writeStash(stash);
+              }
+            }
+            await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
+          } else if (harnessId === "antigravity") {
+            const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+            if (!doc.mcpServers || typeof doc.mcpServers !== "object" || Array.isArray(doc.mcpServers)) {
+              doc.mcpServers = {};
+            }
+            const prev = doc.mcpServers[server.name] ?? {};
+            doc.mcpServers[server.name] = encodeAntigravityEntry(server, prev);
+            await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
+          } else if (harnessId === "opencode") {
+            const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+            if (!doc.mcp || typeof doc.mcp !== "object" || Array.isArray(doc.mcp)) {
+              doc.mcp = {};
+            }
+            const prev = doc.mcp[server.name] ?? {};
+            doc.mcp[server.name] = encodeOpenCodeEntry(server, prev);
+            await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
           }
-        }
-        await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
-      } else if (harnessId === "antigravity") {
-        const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
-        if (!doc.mcpServers || typeof doc.mcpServers !== "object" || Array.isArray(doc.mcpServers)) {
-          doc.mcpServers = {};
-        }
-        const prev = doc.mcpServers[server.name] ?? {};
-        doc.mcpServers[server.name] = encodeAntigravityEntry(server, prev);
-        await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
-      } else if (harnessId === "opencode") {
-        const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
-        if (!doc.mcp || typeof doc.mcp !== "object" || Array.isArray(doc.mcp)) {
-          doc.mcp = {};
-        }
-        const prev = doc.mcp[server.name] ?? {};
-        doc.mcp[server.name] = encodeOpenCodeEntry(server, prev);
-        await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
-      }
 
-      results.push({ harnessId, configPath, ok: true });
-    }
+          this.#fileCache.invalidate(configPath);
+          return { harnessId, configPath, ok: true };
+        }),
+      ),
+    );
     return { server, results };
   }
 
@@ -797,61 +1184,64 @@ export class McpConfigStore {
       HARNESS_IDS.includes(id),
     );
     const paths = await this.#resolvePaths();
-    const results = [];
 
-    for (const harnessId of validTargets) {
-      const configPath = paths[harnessId];
-      const existingRaw = await readFile(configPath, "utf8").catch(() => null);
-      if (existingRaw === null && harnessId !== "claude-code") {
-        results.push({ harnessId, removed: false });
-        continue;
-      }
-
-      let changed = false;
-      if (harnessId === "codex" && existingRaw !== null) {
-        const parsed = parseCodexMcpToml(existingRaw);
-        if (Object.hasOwn(parsed.servers, name)) {
-          await this.#createBackup(harnessId, configPath, existingRaw, `delete:${name}`);
-          const nextContent = patchCodexMcpToml(existingRaw, name, null);
-          await atomicWriteUtf8(configPath, nextContent);
-          changed = true;
-        }
-      } else if (harnessId === "claude-code") {
-        const stash = await this.#readStash();
-        if (Object.hasOwn(stash, name)) {
-          delete stash[name];
-          await this.#writeStash(stash);
-          changed = true;
-        }
-        if (existingRaw !== null) {
-          const doc = existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
-          if (doc.mcpServers && Object.hasOwn(doc.mcpServers, name)) {
-            await this.#createBackup(harnessId, configPath, existingRaw, `delete:${name}`);
-            delete doc.mcpServers[name];
-            await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
-            changed = true;
+    const results = await Promise.all(
+      validTargets.map((harnessId) =>
+        this.#enqueue(harnessId, async () => {
+          const configPath = paths[harnessId];
+          const existingRaw = await readFile(configPath, "utf8").catch(() => null);
+          if (existingRaw === null && harnessId !== "claude-code") {
+            return { harnessId, removed: false };
           }
-        }
-      } else if (harnessId === "antigravity" && existingRaw !== null) {
-        const doc = existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
-        if (doc.mcpServers && Object.hasOwn(doc.mcpServers, name)) {
-          await this.#createBackup(harnessId, configPath, existingRaw, `delete:${name}`);
-          delete doc.mcpServers[name];
-          await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
-          changed = true;
-        }
-      } else if (harnessId === "opencode" && existingRaw !== null) {
-        const doc = existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
-        if (doc.mcp && Object.hasOwn(doc.mcp, name)) {
-          await this.#createBackup(harnessId, configPath, existingRaw, `delete:${name}`);
-          delete doc.mcp[name];
-          await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
-          changed = true;
-        }
-      }
 
-      results.push({ harnessId, removed: changed });
-    }
+          let changed = false;
+          if (harnessId === "codex" && existingRaw !== null) {
+            const parsed = parseCodexMcpToml(existingRaw);
+            if (Object.hasOwn(parsed.servers, name)) {
+              await this.#createBackup(harnessId, configPath, existingRaw, `delete:${name}`);
+              const nextContent = patchCodexMcpToml(existingRaw, name, null);
+              await atomicWriteUtf8(configPath, nextContent);
+              changed = true;
+            }
+          } else if (harnessId === "claude-code") {
+            const stash = await this.#readStash();
+            if (Object.hasOwn(stash, name)) {
+              delete stash[name];
+              await this.#writeStash(stash);
+              changed = true;
+            }
+            if (existingRaw !== null) {
+              const doc = existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+              if (doc.mcpServers && Object.hasOwn(doc.mcpServers, name)) {
+                await this.#createBackup(harnessId, configPath, existingRaw, `delete:${name}`);
+                delete doc.mcpServers[name];
+                await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
+                changed = true;
+              }
+            }
+          } else if (harnessId === "antigravity" && existingRaw !== null) {
+            const doc = existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+            if (doc.mcpServers && Object.hasOwn(doc.mcpServers, name)) {
+              await this.#createBackup(harnessId, configPath, existingRaw, `delete:${name}`);
+              delete doc.mcpServers[name];
+              await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
+              changed = true;
+            }
+          } else if (harnessId === "opencode" && existingRaw !== null) {
+            const doc = existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+            if (doc.mcp && Object.hasOwn(doc.mcp, name)) {
+              await this.#createBackup(harnessId, configPath, existingRaw, `delete:${name}`);
+              delete doc.mcp[name];
+              await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
+              changed = true;
+            }
+          }
+
+          if (changed) this.#fileCache.invalidate(configPath);
+          return { harnessId, removed: changed };
+        }),
+      ),
+    );
     return { name, results };
   }
 
@@ -906,8 +1296,32 @@ export class McpConfigStore {
     return { sourceHarnessId, targets, synced };
   }
 
-  async buildOverview() {
-    const snapshots = await Promise.all(HARNESS_IDS.map((id) => this.readHarness(id)));
+  async buildOverview({ includeBackups = true } = {}) {
+    const t0 = performance.now();
+    // Single-pass path resolution avoids 4x redundant opencode candidate stat probes.
+    const paths = await this.#resolvePaths();
+    const [snapshots, nativePlugins, backups] = await Promise.all([
+      Promise.all(HARNESS_IDS.map((id) => this.readHarness(id, paths))),
+      this.readNativePlugins(),
+      includeBackups ? this.listBackups() : Promise.resolve(null),
+    ]);
+
+    const cacheHits = snapshots.filter((s) => s.cacheHit).length;
+    const memoSig = `${snapshots.map((s) => s.sig).join("|")}::${nativePlugins.sig}::${
+      includeBackups ? `b${this.#backupVersion}:${backups?.length ?? 0}` : "nobkp"
+    }`;
+
+    if (this.#overviewMemo && this.#overviewMemo.sig === memoSig) {
+      return {
+        ...this.#overviewMemo.payload,
+        perf: {
+          readMs: Math.round((performance.now() - t0) * 100) / 100,
+          cacheHits,
+          harnessTotal: snapshots.length,
+        },
+      };
+    }
+
     const harnesses = snapshots.map((snap) => {
       const list = Object.values(snap.servers);
       return {
@@ -924,9 +1338,13 @@ export class McpConfigStore {
       };
     });
 
-    // Build unified cross-harness matrix keyed by server name.
     const byName = new Map();
+    const scopedEntries = [...nativePlugins.pluginMcpServers];
+
     for (const snap of snapshots) {
+      if (Array.isArray(snap.projectServers)) {
+        scopedEntries.push(...snap.projectServers);
+      }
       for (const [name, entry] of Object.entries(snap.servers)) {
         if (!byName.has(name)) {
           byName.set(name, {
@@ -943,9 +1361,7 @@ export class McpConfigStore {
 
     const servers = [...byName.values()]
       .map((group) => {
-        const fingerprints = new Set(
-          Object.values(group.instances).map((e) => serverFingerprint(e)),
-        );
+        const drift = computeServerDrift(group.instances);
         const cliHints = {};
         for (const hid of HARNESS_IDS) {
           cliHints[hid] = {
@@ -965,7 +1381,8 @@ export class McpConfigStore {
           headers: group.primary.headers ?? {},
           bearerTokenEnvVar: group.primary.bearerTokenEnvVar ?? null,
           primaryHarnessId: group.primaryHarnessId,
-          hasDrift: fingerprints.size > 1,
+          hasDrift: drift.hasDrift,
+          driftFields: drift.fields,
           harnessCount: Object.keys(group.instances).length,
           instances: group.instances,
           cliHints,
@@ -973,12 +1390,27 @@ export class McpConfigStore {
       })
       .sort((a, b) => a.name.localeCompare(b.name, "en"));
 
-    const backups = await this.listBackups();
-    return { harnesses, servers, backups };
+    const payload = {
+      harnesses,
+      servers,
+      scopedServers: scopedEntries,
+      nativePlugins: nativePlugins.plugins,
+      ...(backups !== null ? { backups } : {}),
+    };
+    this.#overviewMemo = { sig: memoSig, payload };
+
+    return {
+      ...payload,
+      perf: {
+        readMs: Math.round((performance.now() - t0) * 100) / 100,
+        cacheHits,
+        harnessTotal: snapshots.length,
+      },
+    };
   }
 
   async exportStandardJson(harnessId = null) {
-    const overview = await this.buildOverview();
+    const overview = await this.buildOverview({ includeBackups: false });
     const mcpServers = {};
     for (const item of overview.servers) {
       const source = harnessId ? item.instances[harnessId] : item.instances[item.primaryHarnessId];
@@ -999,20 +1431,4 @@ export class McpConfigStore {
     }
     return JSON.stringify({ mcpServers }, null, 2);
   }
-}
-
-function serverFingerprint(entry) {
-  if (entry.transport === "http" || entry.transport === "sse") {
-    return JSON.stringify({
-      t: entry.transport,
-      u: entry.url,
-      h: Object.keys(entry.headers ?? {}).sort(),
-    });
-  }
-  return JSON.stringify({
-    t: "stdio",
-    c: entry.command,
-    a: entry.args ?? [],
-    e: Object.keys(entry.env ?? {}).sort(),
-  });
 }

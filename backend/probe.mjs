@@ -1,11 +1,10 @@
 /**
  * Pure-Node MCP diagnostics and live connectivity probe (no subprocess spawning).
  *
- * - Remote HTTP / SSE servers: sends MCP `initialize` + `tools/list` via `fetch`, parses both
- *   JSON and SSE (`text/event-stream`) responses, and discovers RFC 9728 / RFC 8414 OAuth metadata
- *   when HTTP 401/403 is returned.
- * - Stdio servers: verifies executable availability on PATH / absolute path via `node:fs/promises`
- *   without spawning any external process.
+ * Performance features:
+ * - 60s TTL in-memory probe result cache keyed by server fingerprint (instant tab re-open).
+ * - 30s TTL PATH executable lookup cache (avoids redundant filesystem scans across Stdio servers).
+ * - Bounded concurrency pool (`probeAllServers`, concurrency=4) for batch probing without event-loop spikes.
  */
 
 import { access, stat } from "node:fs/promises";
@@ -14,6 +13,36 @@ import path from "node:path";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MCP_PROTOCOL_VERSION = "2025-03-26";
+const PROBE_CACHE_TTL_MS = 60_000;
+const PATH_CACHE_TTL_MS = 30_000;
+
+const probeCache = new Map();
+const execCache = new Map();
+
+function serverCacheKey(server) {
+  if (server.transport === "http" || server.transport === "sse" || server.url) {
+    return `r:${server.url ?? ""}:${Object.keys(server.headers ?? {}).sort().join(",")}:${Boolean(server.headers?.Authorization)}`;
+  }
+  return `s:${server.command ?? ""}`;
+}
+
+export function getCachedProbes(servers) {
+  const now = Date.now();
+  const out = {};
+  for (const s of servers ?? []) {
+    const key = serverCacheKey(s);
+    const hit = probeCache.get(key);
+    if (hit && now - hit.at < PROBE_CACHE_TTL_MS) {
+      out[s.name] = { ...hit.data, cached: true, probedAt: hit.at };
+    }
+  }
+  return out;
+}
+
+export function clearProbeCache() {
+  probeCache.clear();
+  execCache.clear();
+}
 
 function parseWwwAuthenticate(headerValue) {
   if (!headerValue) return {};
@@ -26,7 +55,7 @@ function parseWwwAuthenticate(headerValue) {
   return result;
 }
 
-async function fetchJsonSafe(url, timeoutMs = 6_000) {
+async function fetchJsonSafe(url, timeoutMs = 5_000) {
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -45,7 +74,6 @@ export async function discoverOAuthMetadata(mcpUrl, wwwAuthenticateHeader = "") 
   const origin = parsedUrl.origin;
   const authParams = parseWwwAuthenticate(wwwAuthenticateHeader);
 
-  // Step 1: RFC 9728 Protected Resource Metadata
   const resourceMetadataCandidates = [];
   if (authParams.resource_metadata) {
     resourceMetadataCandidates.push(authParams.resource_metadata);
@@ -67,7 +95,6 @@ export async function discoverOAuthMetadata(mcpUrl, wwwAuthenticateHeader = "") 
     }
   }
 
-  // Step 2: RFC 8414 Authorization Server Metadata
   const authServerOrigin =
     Array.isArray(protectedResource?.authorization_servers) &&
     typeof protectedResource.authorization_servers[0] === "string"
@@ -117,9 +144,8 @@ function parseJsonRpcResponse(text, contentType) {
         .map((l) => l.slice(5).trim())
         .filter(Boolean);
       if (dataLines.length === 0) continue;
-      const joined = dataLines.join("\n");
       try {
-        messages.push(JSON.parse(joined));
+        messages.push(JSON.parse(dataLines.join("\n")));
       } catch {
         // Ignore non-JSON SSE control events.
       }
@@ -166,7 +192,7 @@ async function probeRemoteServer(server) {
         params: {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: "codexhost-mcp-hub", version: "1.0.0" },
+          clientInfo: { name: "codexhost-mcp-hub", version: "1.1.0" },
         },
       }),
       signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
@@ -211,7 +237,6 @@ async function probeRemoteServer(server) {
     const serverInfo = initRpc.result?.serverInfo ?? null;
     const protocolVersion = initRpc.result?.protocolVersion ?? MCP_PROTOCOL_VERSION;
 
-    // Best-effort initialized notification + tools/list discovery.
     const sessionHeaders = {
       ...baseHeaders,
       ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
@@ -220,7 +245,7 @@ async function probeRemoteServer(server) {
       method: "POST",
       headers: sessionHeaders,
       body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-      signal: AbortSignal.timeout(4_000),
+      signal: AbortSignal.timeout(3_500),
     }).catch(() => {});
 
     let tools = [];
@@ -237,14 +262,14 @@ async function probeRemoteServer(server) {
           toolsRes.headers.get("content-type"),
         );
         if (Array.isArray(toolsRpc?.result?.tools)) {
-          tools = toolsRpc.result.tools.slice(0, 100).map((t) => ({
+          tools = toolsRpc.result.tools.slice(0, 120).map((t) => ({
             name: String(t.name ?? ""),
-            description: typeof t.description === "string" ? t.description.slice(0, 240) : "",
+            description: typeof t.description === "string" ? t.description.slice(0, 200) : "",
           }));
         }
       }
     } catch {
-      // Tools discovery is optional if initialize already succeeded.
+      // Optional tools listing.
     }
 
     return {
@@ -255,7 +280,7 @@ async function probeRemoteServer(server) {
       serverInfo: serverInfo
         ? {
             name: String(serverInfo.name ?? ""),
-            version: typeof serverInfo.version === "string" ? serverInfo.version : undefined,
+            ...(typeof serverInfo.version === "string" ? { version: serverInfo.version } : {}),
           }
         : null,
       tools,
@@ -282,6 +307,11 @@ async function isRunnableFile(candidate, platform) {
 
 async function resolveExecutableOnPath(command, env = process.env, platform = process.platform) {
   if (!command) return null;
+  const cached = execCache.get(command);
+  if (cached && Date.now() - cached.at < PATH_CACHE_TTL_MS) {
+    return cached.resolved;
+  }
+
   const hasSeparator = command.includes("/") || command.includes("\\") || path.isAbsolute(command);
   const pathKey = Object.keys(env).find((k) => k.toLowerCase() === "path") ?? "PATH";
   const delimiter = platform === "win32" ? ";" : ":";
@@ -290,22 +320,30 @@ async function resolveExecutableOnPath(command, env = process.env, platform = pr
       ? (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)
       : [""];
 
+  let found = null;
   if (hasSeparator) {
     for (const ext of extList) {
       const candidate = command + ext;
-      if (await isRunnableFile(candidate, platform)) return path.resolve(candidate);
+      if (await isRunnableFile(candidate, platform)) {
+        found = path.resolve(candidate);
+        break;
+      }
     }
-    return null;
+  } else {
+    const dirs = (env[pathKey] ?? "").split(delimiter).filter(Boolean);
+    outer: for (const dir of dirs) {
+      for (const ext of extList) {
+        const candidate = path.join(dir, command + ext);
+        if (await isRunnableFile(candidate, platform)) {
+          found = path.resolve(candidate);
+          break outer;
+        }
+      }
+    }
   }
 
-  const dirs = (env[pathKey] ?? "").split(delimiter).filter(Boolean);
-  for (const dir of dirs) {
-    for (const ext of extList) {
-      const candidate = path.join(dir, command + ext);
-      if (await isRunnableFile(candidate, platform)) return path.resolve(candidate);
-    }
-  }
-  return null;
+  execCache.set(command, { resolved: found, at: Date.now() });
+  return found;
 }
 
 async function probeStdioServer(server) {
@@ -331,12 +369,47 @@ async function probeStdioServer(server) {
   };
 }
 
-export async function probeMcpServer(server) {
+export async function probeMcpServer(server, { force = true } = {}) {
   if (!server || typeof server !== "object") {
     return { status: "error", latencyMs: 0, message: "Invalid server payload" };
   }
-  if (server.transport === "http" || server.transport === "sse" || server.url) {
-    return probeRemoteServer(server);
+  const key = serverCacheKey(server);
+  if (!force) {
+    const hit = probeCache.get(key);
+    if (hit && Date.now() - hit.at < PROBE_CACHE_TTL_MS) {
+      return { ...hit.data, cached: true, probedAt: hit.at };
+    }
   }
-  return probeStdioServer(server);
+  const data =
+    server.transport === "http" || server.transport === "sse" || server.url
+      ? await probeRemoteServer(server)
+      : await probeStdioServer(server);
+  const now = Date.now();
+  probeCache.set(key, { data, at: now });
+  return { ...data, cached: false, probedAt: now };
+}
+
+/**
+ * Probe multiple servers with bounded concurrency (default 4).
+ */
+export async function probeAllServers(servers, { concurrency = 4, force = true } = {}) {
+  const list = Array.isArray(servers) ? servers : [];
+  const results = {};
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < list.length) {
+      const idx = cursor;
+      cursor += 1;
+      const item = list[idx];
+      if (!item?.name) continue;
+      results[item.name] = await probeMcpServer(item, { force });
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, Math.max(1, list.length)) }, () =>
+    worker(),
+  );
+  await Promise.all(workers);
+  return results;
 }
