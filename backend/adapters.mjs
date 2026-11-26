@@ -218,9 +218,12 @@ async function pathExists(filePath) {
   }
 }
 
+let atomicWriteSeq = 0;
+
 async function atomicWriteUtf8(filePath, content) {
   await mkdir(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.mcp-hub-${process.pid}-${Date.now()}.tmp`;
+  atomicWriteSeq += 1;
+  const tmpPath = `${filePath}.mcp-hub-${process.pid}-${Date.now()}-${atomicWriteSeq}.tmp`;
   await writeFile(tmpPath, content, "utf8");
   try {
     await rename(tmpPath, filePath);
@@ -756,31 +759,33 @@ export class McpConfigStore {
 
   async #createBackup(harnessId, configPath, originalRaw, reason) {
     if (originalRaw === null) return null;
-    await mkdir(this.backupsDir, { recursive: true });
-    const now = new Date();
-    const stamp = now.toISOString().replace(/[:.]/gu, "-");
-    const rand = Math.random().toString(36).slice(2, 6);
-    const id = `${stamp}_${rand}_${harnessId}`;
-    const meta = {
-      id,
-      harnessId,
-      configPath,
-      reason,
-      createdAt: now.toISOString(),
-      sizeBytes: Buffer.byteLength(originalRaw, "utf8"),
-    };
+    return this.#enqueue("__backups__", async () => {
+      await mkdir(this.backupsDir, { recursive: true });
+      const now = new Date();
+      const stamp = now.toISOString().replace(/[:.]/gu, "-");
+      const rand = Math.random().toString(36).slice(2, 6);
+      const id = `${stamp}_${rand}_${harnessId}`;
+      const meta = {
+        id,
+        harnessId,
+        configPath,
+        reason,
+        createdAt: now.toISOString(),
+        sizeBytes: Buffer.byteLength(originalRaw, "utf8"),
+      };
 
-    await atomicWriteUtf8(path.join(this.backupsDir, `${id}.dat`), originalRaw);
-    const index = [meta, ...(await this.#loadBackupIndex())];
-    const removed = index.splice(MAX_BACKUPS);
-    this.#backupIndexCache = index;
-    this.#backupVersion += 1;
-    this.#overviewMemo = null;
-    await atomicWriteUtf8(this.backupIndexPath, JSON.stringify(index, null, 2) + "\n");
-    for (const old of removed) {
-      await unlink(path.join(this.backupsDir, `${old.id}.dat`)).catch(() => {});
-    }
-    return meta;
+      await atomicWriteUtf8(path.join(this.backupsDir, `${id}.dat`), originalRaw);
+      const index = [meta, ...(await this.#loadBackupIndex())];
+      const removed = index.splice(MAX_BACKUPS);
+      this.#backupIndexCache = index;
+      this.#backupVersion += 1;
+      this.#overviewMemo = null;
+      await atomicWriteUtf8(this.backupIndexPath, JSON.stringify(index, null, 2) + "\n");
+      for (const old of removed) {
+        await unlink(path.join(this.backupsDir, `${old.id}.dat`)).catch(() => {});
+      }
+      return meta;
+    });
   }
 
   async listBackups() {
