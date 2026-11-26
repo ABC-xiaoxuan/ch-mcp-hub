@@ -1,25 +1,52 @@
 /**
- * Shared MCP Hub v1.1 UI controller — mounted by both `web/index.mjs` (Web left sidebar)
- * and `page/index.mjs` (Desktop Settings plugin page & Web Plugin workspace tab).
+ * Shared MCP Hub v1.2 UI controller — Concept C (Modern Bento App Gallery).
+ * Mounted by both `web/index.mjs` (Web left sidebar) and `page/index.mjs`
+ * (Desktop Settings plugin page & Web Plugin workspace tab).
  *
- * Performance architecture:
- * - Region-based targeted DOM rendering: mounts persistent slots once and patches only the
- *   affected region (header / rail / toolbar / content / footer / drawer / modal / toast).
- * - Persistent `<input data-search-input>` with IME composition guard & 60ms debounce so
- *   searching never drops focus or breaks Chinese/Japanese/Korean input.
- * - Single-card probe & tool-search patching (`patchServerCard`) so inspecting one server or
- *   filtering its tools never re-renders sibling cards.
- * - Optimistic/in-place pending state on matrix pills and plugin switches.
- * - Zero `window.confirm()` dialogs; uses GPU-composited slide-over drawer & custom modals.
+ * Performance & UX architecture:
+ * - Persistent IME-safe top search bar + region-based targeted DOM rendering.
+ * - O(1) single-card dock patching (`patchServerMatrixRow`) + `requestAnimationFrame`
+ *   batched probe card updates (`scheduleCardPatch`).
+ * - Signature Bento expansion (`grid-column: 1 / -1`) when inspecting tools or OAuth 2.1.
+ * - Lazy Backups loading + one-time Presets caching (cuts mutation IPC payloads ~70%).
+ * - Zero-I/O 4s revision heartbeat (`overview.poll`) for live CLI config auto-sync.
+ * - Interactive MCP Tool Playground (`tools/call`), Redacted Export, Snapshot Preview,
+ *   Multi-Select Batch Operations, and keyboard shortcuts (`/`, `N`, `R`, `Esc`).
  */
 
 import { createTranslator, resolveLocale } from "./i18n.mjs";
 import { iconSvg } from "./icons.mjs";
 
 const HARNESS_ORDER = ["claude-code", "antigravity", "opencode", "codex"];
+const DOCK_LABELS = {
+  "claude-code": "Claude",
+  antigravity: "AGY",
+  opencode: "OC",
+  codex: "Codex",
+};
 const TOOLS_INITIAL_LIMIT = 12;
 const SEARCH_DEBOUNCE_MS = 60;
 const VISIBILITY_REFRESH_MIN_INTERVAL_MS = 2500;
+const LIVE_POLL_INTERVAL_MS = 4000;
+
+const KNOWN_VISUALS = {
+  context7: { monogram: "C7", tone: "ink" },
+  notion: { monogram: "N", tone: "porcelain" },
+  playwright: { monogram: "PW", tone: "mint" },
+  github: { monogram: "GH", tone: "cobalt" },
+  filesystem: { monogram: "FS", tone: "amber" },
+  linear: { monogram: "LN", tone: "violet" },
+  figma: { monogram: "FG", tone: "rose" },
+  supabase: { monogram: "SB", tone: "mint" },
+  sentry: { monogram: "SN", tone: "rose" },
+  postgres: { monogram: "PG", tone: "cobalt" },
+  memory: { monogram: "MM", tone: "amber" },
+  "sequential-thinking": { monogram: "ST", tone: "violet" },
+  node_repl: { monogram: "NR", tone: "mint" },
+  pencil: { monogram: "PN", tone: "ink" },
+};
+
+const SQUIRCLE_TONES = ["ink", "cobalt", "mint", "amber", "violet", "rose", "porcelain"];
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -57,6 +84,44 @@ function endpointSummary(server) {
   return [server.command, ...(server.args ?? [])].filter(Boolean).join(" ");
 }
 
+function compactHostSummary(server) {
+  if (server.transport === "http" || server.transport === "sse") {
+    try {
+      const u = new URL(server.url);
+      if (u.hostname === "127.0.0.1" || u.hostname === "localhost") {
+        return `${u.host}${u.pathname === "/" ? "" : u.pathname}`;
+      }
+      return u.hostname;
+    } catch {
+      return server.url || "";
+    }
+  }
+  const rawCmd = server.command || "stdio";
+  const cmd = /[\\/]/u.test(rawCmd) ? rawCmd.split(/[\\/]/u).filter(Boolean).pop() ?? rawCmd : rawCmd;
+  const firstArg = (server.args ?? []).find((a) => a && !a.startsWith("-"));
+  if (firstArg && firstArg.length <= 24 && !/[\\/]/u.test(firstArg)) {
+    return `Stdio · ${cmd} ${firstArg}`;
+  }
+  return `Stdio · ${cmd}`;
+}
+
+function getMonogramVisual(name) {
+  const key = String(name ?? "").trim().toLowerCase();
+  if (KNOWN_VISUALS[key]) return KNOWN_VISUALS[key];
+  const parts = key.split(/[-_./@\s]+/u).filter(Boolean);
+  let monogram = "MC";
+  if (parts.length >= 2) {
+    monogram = `${parts[0][0] ?? ""}${parts[1][0] ?? ""}`.toUpperCase();
+  } else if (parts.length === 1) {
+    monogram = parts[0].slice(0, 2).toUpperCase();
+  }
+  let hash = 0;
+  for (let i = 0; i < key.length; i += 1) {
+    hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+  }
+  return { monogram: monogram || "MC", tone: SQUIRCLE_TONES[hash % SQUIRCLE_TONES.length] };
+}
+
 function shortenPath(p) {
   if (!p) return "";
   return String(p).replace(/^([A-Za-z]:\\Users\\[^\\]+|\/Users\/[^/]+|\/home\/[^/]+)/u, "~");
@@ -84,7 +149,6 @@ export function tokenizeCommandLine(raw) {
       continue;
     }
     if (ch === "\\" && quote !== "'") {
-      // Preserve Windows drive/path backslashes unless escaping whitespace or quotes.
       const next = input[i + 1];
       if (next && (next === '"' || next === "'" || next === " " || next === "\\")) {
         escaped = true;
@@ -142,6 +206,28 @@ function matchPresetCategory(preset, category) {
   return true;
 }
 
+function buildStarterArgsJson(tool) {
+  const fields = tool?.inputSchema?.fields ?? [];
+  if (fields.length === 0) return "{}";
+  const skeleton = {};
+  const requiredFields = fields.filter((f) => f.required);
+  const seed = requiredFields.length > 0 ? requiredFields : fields.slice(0, 3);
+  for (const f of seed) {
+    if (f.type.includes("number") || f.type.includes("integer")) skeleton[f.name] = 0;
+    else if (f.type.includes("boolean")) skeleton[f.name] = false;
+    else if (f.type.includes("array")) skeleton[f.name] = [];
+    else if (f.type.includes("object")) skeleton[f.name] = {};
+    else skeleton[f.name] = "";
+  }
+  return JSON.stringify(skeleton, null, 2);
+}
+
+function isEditableTarget(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || Boolean(el.isContentEditable);
+}
+
 async function copyToClipboard(text, doc) {
   const nav = doc?.defaultView?.navigator;
   if (nav?.clipboard?.writeText) {
@@ -161,6 +247,7 @@ async function copyToClipboard(text, doc) {
 
 export function mountMcpHub(container, bridge) {
   const doc = container.ownerDocument;
+  const win = doc.defaultView;
   const signal = bridge.signal;
   const t = createTranslator(() => bridge.getLocale());
 
@@ -168,22 +255,28 @@ export function mountMcpHub(container, bridge) {
   root.className = "mh-root";
   root.dataset.mhScheme = bridge.getColorScheme() === "dark" ? "dark" : "light";
 
-  // Mount persistent region skeleton once — never rebuild this outer structure.
+  // Persistent region skeleton — outer structure & search input are never torn down.
   root.innerHTML = `
     <div class="mh-shell">
-      <div data-region="header"></div>
-      <div data-region="rail"></div>
-      <div class="mh-toolbar" data-region="toolbar">
-        <div class="mh-tabs" role="tablist" data-region="tabs"></div>
-        <div class="mh-filters" data-region="filters">
-          <div class="mh-search">
-            <span class="mh-search-icon">${iconSvg("search", 14)}</span>
-            <input class="mh-input" type="search" data-search-input aria-label="Search" />
-          </div>
-          <div class="mh-chip-group" data-region="chips"></div>
+      <header class="mh-topbar">
+        <div class="mh-title-group" data-region="title"></div>
+        <div class="mh-search mh-topbar-search">
+          <span class="mh-search-icon">${iconSvg("search", 15)}</span>
+          <input class="mh-input" type="search" data-search-input aria-label="Search" />
+          <kbd class="mh-kbd" aria-hidden="true">/</kbd>
         </div>
+        <div class="mh-header-actions" data-region="actions"></div>
+      </header>
+
+      <div class="mh-nav-bar" data-region="navBar">
+        <div class="mh-seg-tabs" role="tablist" data-region="tabs"></div>
+        <div class="mh-client-strip" data-region="clients" aria-label="Clients"></div>
       </div>
+
+      <div class="mh-subbar" data-region="subbar"></div>
+
       <div data-region="content"></div>
+      <div data-region="batch"></div>
       <div data-region="footer"></div>
     </div>
     <div data-region="drawer"></div>
@@ -193,14 +286,15 @@ export function mountMcpHub(container, bridge) {
   container.replaceChildren(root);
 
   const slots = {
-    header: root.querySelector('[data-region="header"]'),
-    rail: root.querySelector('[data-region="rail"]'),
-    toolbar: root.querySelector('[data-region="toolbar"]'),
-    tabs: root.querySelector('[data-region="tabs"]'),
-    filters: root.querySelector('[data-region="filters"]'),
+    title: root.querySelector('[data-region="title"]'),
     searchInput: root.querySelector("[data-search-input]"),
-    chips: root.querySelector('[data-region="chips"]'),
+    actions: root.querySelector('[data-region="actions"]'),
+    navBar: root.querySelector('[data-region="navBar"]'),
+    tabs: root.querySelector('[data-region="tabs"]'),
+    clients: root.querySelector('[data-region="clients"]'),
+    subbar: root.querySelector('[data-region="subbar"]'),
     content: root.querySelector('[data-region="content"]'),
+    batch: root.querySelector('[data-region="batch"]'),
     footer: root.querySelector('[data-region="footer"]'),
     drawer: root.querySelector('[data-region="drawer"]'),
     modal: root.querySelector('[data-region="modal"]'),
@@ -214,29 +308,51 @@ export function mountMcpHub(container, bridge) {
     busy: false,
     error: null,
     overview: null,
+    revision: 0,
+    backupsLoaded: false,
+    backupsLoading: false,
+    backupsLoadedCount: -1,
     activeTab: "servers", // servers | scoped | presets | backups
     selectedHarness: null,
     transportFilter: "all", // all | http | stdio
     onlyDrift: false,
     presetCategory: "all", // all | oauth | local | dev | knowledge
     search: "",
+    selectedServers: new Set(),
     probes: new Map(), // serverName -> { loading, data }
     expandedProbe: new Set(),
     toolSearch: new Map(), // serverName -> query string
-    toolsExpanded: new Set(), // serverName -> expanded past TOOLS_INITIAL_LIMIT
+    toolsExpanded: new Set(),
     oauthFlows: new Map(),
-    drawer: null, // editor slide-over state
-    modal: null, // sync | delete | import | export | confirm
+    drawer: null, // { mode: 'editor' | 'tool', ... }
+    modal: null, // { type: 'sync' | 'delete' | 'import' | 'export' | 'confirm' | 'backup-preview' | 'batch-sync', ... }
     toast: null,
   };
 
   let toastTimer = null;
   let searchDebounceTimer = null;
+  let livePollTimer = null;
   let isComposingSearch = false;
   let lastRefreshAt = 0;
   let previewSeq = 0;
+  let rafId = null;
+  const pendingCardPatches = new Set();
   const oauthTimers = new Map();
   let disposed = false;
+
+  const invoke = (method, params) => {
+    const clean = (val) => {
+      if (val === undefined) return null;
+      if (val === null || typeof val !== "object") return val;
+      if (Array.isArray(val)) return val.map((item) => clean(item));
+      const out = {};
+      for (const [k, v] of Object.entries(val)) {
+        if (v !== undefined) out[k] = clean(v);
+      }
+      return out;
+    };
+    return params === undefined ? bridge.invoke(method) : bridge.invoke(method, clean(params));
+  };
 
   const stopOAuthPolling = (serverName) => {
     const timer = oauthTimers.get(serverName);
@@ -256,42 +372,25 @@ export function mountMcpHub(container, bridge) {
     return null;
   };
 
+  const buildPresetMap = () => {
+    const map = new Map();
+    for (const p of state.overview?.presets ?? []) {
+      map.set(String(p.id).toLowerCase(), p);
+    }
+    return map;
+  };
+
   const hydrateCachedProbes = (cachedProbes) => {
     if (!cachedProbes || typeof cachedProbes !== "object") return;
     for (const [name, data] of Object.entries(cachedProbes)) {
       const existing = state.probes.get(name);
-      if (!existing || (!existing.loading && (!existing.data?.probedAt || (data.probedAt ?? 0) >= existing.data.probedAt))) {
+      if (
+        !existing ||
+        (!existing.loading && (!existing.data?.probedAt || (data.probedAt ?? 0) >= existing.data.probedAt))
+      ) {
         state.probes.set(name, { loading: false, data });
       }
     }
-  };
-
-  const showToast = (text, isError = false) => {
-    state.toast = { text, isError };
-    if (toastTimer) clearTimeout(toastTimer);
-    renderToast();
-    toastTimer = setTimeout(() => {
-      state.toast = null;
-      renderToast();
-    }, 3400);
-  };
-
-  // -------------------------------------------------------------------------
-  // Data Actions
-  // -------------------------------------------------------------------------
-
-  const invoke = (method, params) => {
-    const clean = (val) => {
-      if (val === undefined) return null;
-      if (val === null || typeof val !== "object") return val;
-      if (Array.isArray(val)) return val.map((item) => clean(item));
-      const out = {};
-      for (const [k, v] of Object.entries(val)) {
-        if (v !== undefined) out[k] = clean(v);
-      }
-      return out;
-    };
-    return params === undefined ? bridge.invoke(method) : bridge.invoke(method, clean(params));
   };
 
   const indexSearchHaystacks = (overview) => {
@@ -306,7 +405,101 @@ export function mountMcpHub(container, bridge) {
     }
   };
 
+  const pruneSelection = () => {
+    const valid = new Set((state.overview?.servers ?? []).map((s) => s.name));
+    for (const name of [...state.selectedServers]) {
+      if (!valid.has(name)) state.selectedServers.delete(name);
+    }
+  };
+
+  const showToast = (text, isError = false) => {
+    state.toast = { text, isError };
+    if (toastTimer) clearTimeout(toastTimer);
+    renderToast();
+    toastTimer = setTimeout(() => {
+      state.toast = null;
+      renderToast();
+    }, 3400);
+  };
+
+  const scheduleCardPatch = (serverName) => {
+    pendingCardPatches.add(serverName);
+    if (rafId !== null) return;
+    const flush = () => {
+      rafId = null;
+      if (disposed) return;
+      const names = [...pendingCardPatches];
+      pendingCardPatches.clear();
+      for (const n of names) patchServerCard(n);
+    };
+    if (typeof win?.requestAnimationFrame === "function") {
+      rafId = win.requestAnimationFrame(flush);
+    } else {
+      flush();
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Data Actions
+  // -------------------------------------------------------------------------
+
+  const applyOverviewUpdate = (nextOverview) => {
+    if (!nextOverview) return;
+    const prevPresets = state.overview?.presets;
+    const prevBackups = state.overview?.backups;
+    const merged = {
+      ...state.overview,
+      ...nextOverview,
+      presets: nextOverview.presets ?? prevPresets ?? [],
+      ...(nextOverview.backups !== undefined
+        ? { backups: nextOverview.backups }
+        : prevBackups !== undefined
+          ? { backups: prevBackups }
+          : {}),
+    };
+    indexSearchHaystacks(merged);
+    state.overview = merged;
+    if (Number.isFinite(nextOverview.revision)) {
+      state.revision = nextOverview.revision;
+    }
+    if (nextOverview.backups !== undefined) {
+      state.backupsLoaded = true;
+      state.backupsLoadedCount = nextOverview.backups.length;
+    }
+    hydrateCachedProbes(nextOverview.cachedProbes);
+    pruneSelection();
+    lastRefreshAt = Date.now();
+  };
+
+  const ensureBackupsLoaded = async (force = false) => {
+    const expectedCount = state.overview?.backupCount ?? 0;
+    if (!force && state.backupsLoaded && state.backupsLoadedCount === expectedCount) {
+      return;
+    }
+    if (state.backupsLoading) return;
+    state.backupsLoading = true;
+    if (state.activeTab === "backups") renderContent();
+    try {
+      const res = await invoke("backups.list");
+      if (disposed || signal.aborted) return;
+      const list = Array.isArray(res?.backups) ? res.backups : [];
+      if (state.overview) {
+        state.overview = { ...state.overview, backups: list, backupCount: list.length };
+      }
+      state.backupsLoaded = true;
+      state.backupsLoadedCount = list.length;
+      state.backupsLoading = false;
+      renderNavBar();
+      if (state.activeTab === "backups") renderContent();
+    } catch {
+      state.backupsLoading = false;
+      if (state.activeTab === "backups") renderContent();
+    }
+  };
+
   const loadOverview = async (silent = false) => {
+    const needPresets = !state.overview?.presets?.length;
+    const needBackups = state.activeTab === "backups";
     if (!silent) {
       state.loading = true;
       state.error = null;
@@ -316,15 +509,15 @@ export function mountMcpHub(container, bridge) {
       renderHeader();
     }
     try {
-      const data = await invoke("overview.get");
+      const data = await invoke("overview.get", {
+        includeBackups: needBackups,
+        includePresets: needPresets,
+      });
       if (disposed || signal.aborted) return;
-      indexSearchHaystacks(data);
-      state.overview = data;
-      hydrateCachedProbes(data?.cachedProbes);
+      applyOverviewUpdate(data);
       state.loading = false;
       state.refreshing = false;
       state.error = null;
-      lastRefreshAt = Date.now();
       renderAll();
     } catch (error) {
       if (disposed || signal.aborted) return;
@@ -337,15 +530,39 @@ export function mountMcpHub(container, bridge) {
     }
   };
 
-  const applyOverviewUpdate = (nextOverview) => {
-    if (!nextOverview) return;
-    indexSearchHaystacks(nextOverview);
-    state.overview = {
-      ...state.overview,
-      ...nextOverview,
-    };
-    hydrateCachedProbes(nextOverview.cachedProbes);
-    lastRefreshAt = Date.now();
+  const pollLiveChanges = async () => {
+    if (
+      disposed ||
+      signal.aborted ||
+      doc.visibilityState !== "visible" ||
+      state.loading ||
+      state.busy ||
+      state.probingAll ||
+      state.drawer ||
+      state.modal ||
+      state.revision <= 0
+    ) {
+      return;
+    }
+    try {
+      const res = await invoke("overview.poll", { sinceRevision: state.revision });
+      if (disposed || signal.aborted) return;
+      if (res?.changed && res.overview) {
+        applyOverviewUpdate(res.overview);
+        renderHeader();
+        renderNavBar();
+        renderSubbar();
+        renderContent();
+        renderBatchBar();
+        renderFooter();
+        if (state.activeTab === "backups") {
+          ensureBackupsLoaded(true);
+        }
+        showToast(t("toastLiveSynced"));
+      }
+    } catch {
+      // Ignore transient poll hiccups; next heartbeat recovers cleanly.
+    }
   };
 
   const invokeWithOverview = async (
@@ -367,9 +584,8 @@ export function mountMcpHub(container, bridge) {
       if (lockGlobal) state.busy = false;
       if (successMsg) showToast(successMsg);
       renderHeader();
-      renderRail();
-      renderToolbar();
-      // Fast O(1) single-row DOM patch when toggling a pill or quick-syncing (0 sibling rebuilds).
+      renderNavBar();
+      renderSubbar();
       const patched =
         patchRow &&
         state.activeTab === "servers" &&
@@ -377,6 +593,7 @@ export function mountMcpHub(container, bridge) {
         !state.onlyDrift &&
         patchServerMatrixRow(patchRow);
       if (!patched) renderContent();
+      renderBatchBar();
       renderFooter();
       return res;
     } catch (error) {
@@ -423,7 +640,7 @@ export function mountMcpHub(container, bridge) {
       for (const [name, data] of Object.entries(results)) {
         state.probes.set(name, { loading: false, data });
         count += 1;
-        patchServerCard(name);
+        scheduleCardPatch(name);
       }
       state.probingAll = false;
       renderHeader();
@@ -553,7 +770,7 @@ export function mountMcpHub(container, bridge) {
 
   const refreshDrawerPreview = async () => {
     const d = state.drawer;
-    if (!d || d.activeTab !== "preview") return;
+    if (!d || d.mode !== "editor" || d.activeTab !== "preview") return;
     const seq = ++previewSeq;
     const targets = [...d.targets];
     if (targets.length === 0) {
@@ -636,6 +853,7 @@ export function mountMcpHub(container, bridge) {
     const targets = new Set(defaultTargets.length > 0 ? defaultTargets : HARNESS_ORDER);
 
     const drawerState = {
+      mode: "editor",
       isEdit: Boolean(editServer),
       editServer,
       sourceHarnessId,
@@ -662,6 +880,22 @@ export function mountMcpHub(container, bridge) {
     renderDrawer();
   };
 
+  const openToolDrawer = (serverName, toolName) => {
+    const tools = state.probes.get(serverName)?.data?.tools ?? [];
+    const tool = tools.find((item) => item.name === toolName);
+    if (!tool) return;
+    state.drawer = {
+      mode: "tool",
+      serverName,
+      tool,
+      argsText: buildStarterArgsJson(tool),
+      running: false,
+      error: null,
+      result: null,
+    };
+    renderDrawer();
+  };
+
   const openSyncModal = (server) => {
     const configured = Object.keys(server.instances);
     const source =
@@ -674,6 +908,18 @@ export function mountMcpHub(container, bridge) {
       server,
       sourceHarnessId: source,
       targets: new Set(missing.length > 0 ? missing : HARNESS_ORDER.filter((id) => id !== source)),
+    };
+    renderModal();
+  };
+
+  const openBatchSyncModal = () => {
+    const names = [...state.selectedServers];
+    if (names.length === 0) return;
+    const existingHarnesses = (state.overview?.harnesses ?? []).filter((h) => h.exists).map((h) => h.id);
+    state.modal = {
+      type: "batch-sync",
+      names,
+      targets: new Set(existingHarnesses.length > 0 ? existingHarnesses : HARNESS_ORDER),
     };
     renderModal();
   };
@@ -698,15 +944,33 @@ export function mountMcpHub(container, bridge) {
     renderModal();
   };
 
-  const openExportModal = async () => {
+  const openExportModal = async (redactSecrets = true) => {
     try {
       const res = await invoke("config.exportJson", {
         harnessId: state.selectedHarness,
+        redactSecrets,
       });
       if (disposed || signal.aborted) return;
       state.modal = {
         type: "export",
         json: res.json,
+        redactSecrets: res.redactSecrets !== false,
+      };
+      renderModal();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error), true);
+    }
+  };
+
+  const openBackupPreviewModal = async (backupId, harnessName) => {
+    try {
+      const data = await invoke("backups.preview", { backupId });
+      if (disposed || signal.aborted) return;
+      state.modal = {
+        type: "backup-preview",
+        backupId,
+        harnessName,
+        data,
       };
       renderModal();
     } catch (error) {
@@ -745,119 +1009,11 @@ export function mountMcpHub(container, bridge) {
 
   const renderHeader = () => {
     const hasServers = (state.overview?.servers?.length ?? 0) > 0;
-    slots.header.innerHTML = `
-      <header class="mh-header">
-        <div class="mh-title-group">
-          <div class="mh-brand-mark">${iconSvg("hub", 20)}</div>
-          <div>
-            <h1 class="mh-title">${escapeHtml(t("title"))}</h1>
-            <p class="mh-subtitle">${escapeHtml(t("subtitle"))}</p>
-          </div>
-        </div>
-        <div class="mh-header-actions">
-          <button type="button" class="mh-btn mh-btn--primary" data-action="open-add" ${state.busy ? "disabled" : ""}>
-            ${iconSvg("plus", 14)}<span>${escapeHtml(t("addServer"))}</span>
-          </button>
-          <button type="button" class="mh-btn${state.probingAll ? " mh-spin" : ""}" data-action="probe-all" ${state.busy || state.probingAll || !hasServers ? "disabled" : ""}>
-            ${iconSvg("radar", 14)}<span>${escapeHtml(t(state.probingAll ? "probingAll" : "probeAll"))}</span>
-          </button>
-          <button type="button" class="mh-btn" data-action="open-import" ${state.busy ? "disabled" : ""}>
-            ${iconSvg("upload", 14)}<span>${escapeHtml(t("importJson"))}</span>
-          </button>
-          <button type="button" class="mh-btn" data-action="open-export" ${state.busy ? "disabled" : ""}>
-            ${iconSvg("download", 14)}<span>${escapeHtml(t("exportJson"))}</span>
-          </button>
-          <button type="button" class="mh-btn mh-btn--ghost${state.refreshing ? " mh-spin" : ""}" data-action="refresh" title="${escapeHtml(t("refresh"))}" aria-label="${escapeHtml(t("refresh"))}" ${state.busy ? "disabled" : ""}>
-            ${iconSvg("refresh", 15)}
-          </button>
-        </div>
-      </header>
-    `;
-  };
-
-  const renderRail = () => {
-    const harnesses = state.overview?.harnesses ?? [];
-    if (harnesses.length === 0) {
-      slots.rail.innerHTML = "";
-      return;
-    }
-    slots.rail.innerHTML = `
-      <section class="mh-harness-rail" aria-label="Harnesses">
-        ${harnesses
-          .map((h) => {
-            const selected = state.selectedHarness === h.id;
-            const pathLabel = h.exists ? shortenPath(h.configPath) : t("notCreatedYet");
-            return `
-              <div
-                class="mh-harness-card${selected ? " is-selected" : ""}"
-                style="--card-accent:${escapeHtml(h.accent)}"
-                data-action="filter-harness"
-                data-harness="${escapeHtml(h.id)}"
-                role="button"
-                tabindex="0"
-                aria-pressed="${selected ? "true" : "false"}"
-              >
-                <div class="mh-harness-top">
-                  <span class="mh-harness-name">
-                    <span class="mh-dot" style="background:${escapeHtml(h.accent)}"></span>
-                    ${escapeHtml(h.name)}
-                  </span>
-                  <span class="mh-format-tag">${escapeHtml(h.format)}</span>
-                </div>
-                <div class="mh-harness-metric">
-                  <span class="mh-harness-count">
-                    ${h.enabledCount}<small>/ ${h.totalCount}</small>
-                  </span>
-                  ${
-                    h.totalCount > 0
-                      ? `<button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="sync-all" data-harness="${escapeHtml(h.id)}" title="${escapeHtml(t("syncAll"))}">${iconSvg("sync", 13)}<span>${escapeHtml(t("sync"))}</span></button>`
-                      : ""
-                  }
-                </div>
-                ${
-                  h.parseError
-                    ? `<div class="mh-harness-err">${escapeHtml(t("parseError"))}: ${escapeHtml(h.parseError)}</div>`
-                    : `<div class="mh-harness-path" title="${escapeHtml(h.configPath)}">${escapeHtml(pathLabel)}</div>`
-                }
-              </div>
-            `;
-          })
-          .join("")}
-      </section>
-    `;
-  };
-
-  const renderToolbar = () => {
-    const hasOverview = Boolean(state.overview);
-    slots.toolbar.hidden = !hasOverview;
-    if (!hasOverview) return;
-
-    const serverCount = state.overview.servers?.length ?? 0;
-    const scopedCount =
-      (state.overview.nativePlugins?.length ?? 0) + (state.overview.scopedServers?.length ?? 0);
-    const presetCount = state.overview.presets?.length ?? 0;
-    const backupCount = state.overview.backups?.length ?? 0;
-
-    slots.tabs.innerHTML = `
-      <button type="button" role="tab" aria-selected="${state.activeTab === "servers"}" class="mh-tab${state.activeTab === "servers" ? " is-active" : ""}" data-action="switch-tab" data-tab="servers">
-        ${escapeHtml(t("tabServers"))} <span class="mh-tab-count">${serverCount}</span>
-      </button>
-      <button type="button" role="tab" aria-selected="${state.activeTab === "scoped"}" class="mh-tab${state.activeTab === "scoped" ? " is-active" : ""}" data-action="switch-tab" data-tab="scoped">
-        ${escapeHtml(t("tabScoped"))} <span class="mh-tab-count">${scopedCount}</span>
-      </button>
-      <button type="button" role="tab" aria-selected="${state.activeTab === "presets"}" class="mh-tab${state.activeTab === "presets" ? " is-active" : ""}" data-action="switch-tab" data-tab="presets">
-        ${escapeHtml(t("tabPresets"))} <span class="mh-tab-count">${presetCount}</span>
-      </button>
-      <button type="button" role="tab" aria-selected="${state.activeTab === "backups"}" class="mh-tab${state.activeTab === "backups" ? " is-active" : ""}" data-action="switch-tab" data-tab="backups">
-        ${escapeHtml(t("tabBackups"))} <span class="mh-tab-count">${backupCount}</span>
-      </button>
+    slots.title.innerHTML = `
+      <h1 class="mh-title">${escapeHtml(t("title"))}</h1>
+      <p class="mh-subtitle">${escapeHtml(t("subtitle"))}</p>
     `;
 
-    const showFilters = state.activeTab === "servers" || state.activeTab === "presets";
-    slots.filters.hidden = !showFilters;
-    if (!showFilters) return;
-
-    // Update search placeholder in place without touching DOM node or focus!
     const nextPlaceholder =
       state.activeTab === "presets" ? t("presetSearchPlaceholder") : t("searchPlaceholder");
     if (slots.searchInput.placeholder !== nextPlaceholder) {
@@ -867,12 +1023,125 @@ export function mountMcpHub(container, bridge) {
       slots.searchInput.value = state.search;
     }
 
+    slots.actions.innerHTML = `
+      <div class="mh-util-cluster">
+        <button type="button" class="mh-util-btn" data-action="open-import" title="${escapeHtml(t("importJson"))}" aria-label="${escapeHtml(t("importJson"))}" ${state.busy ? "disabled" : ""}>
+          ${iconSvg("upload", 15)}
+        </button>
+        <button type="button" class="mh-util-btn" data-action="open-export" title="${escapeHtml(t("exportJson"))}" aria-label="${escapeHtml(t("exportJson"))}" ${state.busy ? "disabled" : ""}>
+          ${iconSvg("download", 15)}
+        </button>
+        <button type="button" class="mh-util-btn${state.refreshing ? " mh-spin" : ""}" data-action="refresh" title="${escapeHtml(t("refresh"))}" aria-label="${escapeHtml(t("refresh"))}" ${state.busy ? "disabled" : ""}>
+          ${iconSvg("refresh", 15)}
+        </button>
+      </div>
+      <button type="button" class="mh-btn${state.probingAll ? " mh-spin" : ""}" data-action="probe-all" ${state.busy || state.probingAll || !hasServers ? "disabled" : ""}>
+        ${iconSvg("radar", 14)}<span>${escapeHtml(t(state.probingAll ? "probingAll" : "probeAll"))}</span>
+      </button>
+      <button type="button" class="mh-btn mh-btn--primary" data-action="open-add" ${state.busy ? "disabled" : ""}>
+        ${iconSvg("plus", 14)}<span>${escapeHtml(t("addServer"))}</span>
+      </button>
+    `;
+  };
+
+  const renderNavBar = () => {
+    const hasOverview = Boolean(state.overview);
+    slots.navBar.hidden = !hasOverview;
+    if (!hasOverview) return;
+
+    const serverCount = state.overview.servers?.length ?? 0;
+    const scopedCount =
+      (state.overview.nativePlugins?.length ?? 0) + (state.overview.scopedServers?.length ?? 0);
+    const presetCount = state.overview.presets?.length ?? 0;
+    const backupCount = state.overview.backupCount ?? state.overview.backups?.length ?? 0;
+
+    slots.tabs.innerHTML = `
+      <button type="button" role="tab" aria-selected="${state.activeTab === "servers"}" class="mh-tab${state.activeTab === "servers" ? " is-active" : ""}" data-action="switch-tab" data-tab="servers">
+        ${escapeHtml(t("tabServers"))} <span class="mh-tab-count">(${serverCount})</span>
+      </button>
+      <button type="button" role="tab" aria-selected="${state.activeTab === "scoped"}" class="mh-tab${state.activeTab === "scoped" ? " is-active" : ""}" data-action="switch-tab" data-tab="scoped">
+        ${escapeHtml(t("tabScoped"))} <span class="mh-tab-count">(${scopedCount})</span>
+      </button>
+      <button type="button" role="tab" aria-selected="${state.activeTab === "presets"}" class="mh-tab${state.activeTab === "presets" ? " is-active" : ""}" data-action="switch-tab" data-tab="presets">
+        ${escapeHtml(t("tabPresets"))} <span class="mh-tab-count">(${presetCount})</span>
+      </button>
+      <button type="button" role="tab" aria-selected="${state.activeTab === "backups"}" class="mh-tab${state.activeTab === "backups" ? " is-active" : ""}" data-action="switch-tab" data-tab="backups">
+        ${escapeHtml(t("tabBackups"))} <span class="mh-tab-count">(${backupCount})</span>
+      </button>
+    `;
+
+    const harnesses = state.overview.harnesses ?? [];
+    slots.clients.innerHTML = harnesses
+      .map((h) => {
+        const selected = state.selectedHarness === h.id;
+        const tip = h.parseError
+          ? `${t("parseError")}: ${h.parseError}`
+          : `${h.name} · ${h.exists ? shortenPath(h.configPath) : t("notCreatedYet")}`;
+        return `
+          <button
+            type="button"
+            class="mh-client-chip${selected ? " is-selected" : ""}${h.parseError ? " has-error" : ""}"
+            style="--chip-accent:${escapeHtml(h.accent)}"
+            data-action="filter-harness"
+            data-harness="${escapeHtml(h.id)}"
+            aria-pressed="${selected ? "true" : "false"}"
+            title="${escapeHtml(tip)}"
+          >
+            <span class="mh-dot" style="background:${escapeHtml(h.parseError ? "var(--mh-danger)" : h.accent)}"></span>
+            <span>${escapeHtml(h.shortName)}</span>
+            <span class="mh-client-chip-num">${h.enabledCount}</span>
+          </button>
+        `;
+      })
+      .join("");
+  };
+
+  const renderSubbar = () => {
+    const show = Boolean(state.overview) && (state.activeTab === "servers" || state.activeTab === "presets");
+    slots.subbar.hidden = !show;
+    if (!show) {
+      slots.subbar.innerHTML = "";
+      return;
+    }
+
     if (state.activeTab === "servers") {
-      slots.chips.innerHTML = `
-        <button type="button" class="mh-chip${state.transportFilter === "all" && !state.onlyDrift ? " is-active" : ""}" data-action="filter-transport" data-value="all">${escapeHtml(t("filterAll"))}</button>
-        <button type="button" class="mh-chip${state.transportFilter === "http" ? " is-active" : ""}" data-action="filter-transport" data-value="http">${escapeHtml(t("filterHttp"))}</button>
-        <button type="button" class="mh-chip${state.transportFilter === "stdio" ? " is-active" : ""}" data-action="filter-transport" data-value="stdio">${escapeHtml(t("filterStdio"))}</button>
-        <button type="button" class="mh-chip${state.onlyDrift ? " is-active" : ""}" data-action="toggle-drift">${escapeHtml(t("filterDrift"))}</button>
+      const rows = filteredServers();
+      const allRowsChecked = rows.length > 0 && rows.every((r) => state.selectedServers.has(r.name));
+      const activeHarness = state.selectedHarness
+        ? (state.overview?.harnesses ?? []).find((h) => h.id === state.selectedHarness)
+        : null;
+
+      slots.subbar.innerHTML = `
+        <div class="mh-chip-group">
+          <button type="button" class="mh-chip${state.transportFilter === "all" && !state.onlyDrift ? " is-active" : ""}" data-action="filter-transport" data-value="all">${escapeHtml(t("filterAll"))}</button>
+          <button type="button" class="mh-chip${state.transportFilter === "http" ? " is-active" : ""}" data-action="filter-transport" data-value="http">${escapeHtml(t("filterHttp"))}</button>
+          <button type="button" class="mh-chip${state.transportFilter === "stdio" ? " is-active" : ""}" data-action="filter-transport" data-value="stdio">${escapeHtml(t("filterStdio"))}</button>
+          <button type="button" class="mh-chip${state.onlyDrift ? " is-active" : ""}" data-action="toggle-drift">${escapeHtml(t("filterDrift"))}</button>
+        </div>
+        <div class="mh-subbar-right">
+          ${
+            activeHarness
+              ? `
+                ${
+                  activeHarness.totalCount > 0
+                    ? `<button type="button" class="mh-btn mh-btn--sm" data-action="sync-all" data-harness="${escapeHtml(activeHarness.id)}">${iconSvg("sync", 13)}<span>${escapeHtml(t("syncFilteredHarness", { harness: activeHarness.shortName }))}</span></button>`
+                    : ""
+                }
+                <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="clear-harness-filter">${escapeHtml(t("clearHarnessFilter"))}</button>
+              `
+              : ""
+          }
+          ${
+            rows.length > 0
+              ? `
+                <label class="mh-select-all-label">
+                  <input type="checkbox" class="mh-card-check" data-select-all-visible aria-label="${escapeHtml(t("batchSelectAll"))}" ${allRowsChecked ? "checked" : ""} />
+                  <span>${escapeHtml(t("selectAllShort"))}</span>
+                </label>
+              `
+              : ""
+          }
+        </div>
       `;
     } else {
       const cats = [
@@ -882,37 +1151,92 @@ export function mountMcpHub(container, bridge) {
         ["dev", "presetCatDev"],
         ["knowledge", "presetCatKnowledge"],
       ];
-      slots.chips.innerHTML = cats
-        .map(
-          ([val, key]) =>
-            `<button type="button" class="mh-chip${state.presetCategory === val ? " is-active" : ""}" data-action="filter-preset-cat" data-value="${val}">${escapeHtml(t(key))}</button>`,
-        )
-        .join("");
+      slots.subbar.innerHTML = `
+        <div class="mh-chip-group">
+          ${cats
+            .map(
+              ([val, key]) =>
+                `<button type="button" class="mh-chip${state.presetCategory === val ? " is-active" : ""}" data-action="filter-preset-cat" data-value="${val}">${escapeHtml(t(key))}</button>`,
+            )
+            .join("")}
+        </div>
+      `;
     }
   };
 
+  const renderBatchBar = () => {
+    if (state.activeTab !== "servers" || state.selectedServers.size === 0) {
+      slots.batch.innerHTML = "";
+      return;
+    }
+    const count = state.selectedServers.size;
+    slots.batch.innerHTML = `
+      <div class="mh-batch-bar" role="region" aria-label="Batch actions">
+        <div class="mh-batch-left">
+          <span class="mh-label">${escapeHtml(t("batchSelected", { count }))}</span>
+          <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="batch-select-all">${escapeHtml(t("batchSelectAll"))}</button>
+          <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="batch-clear">${escapeHtml(t("batchClear"))}</button>
+        </div>
+        <div class="mh-batch-actions">
+          <button type="button" class="mh-btn mh-btn--sm" data-action="batch-enable" ${state.busy ? "disabled" : ""}>${iconSvg("check", 13)}<span>${escapeHtml(t("batchEnable"))}</span></button>
+          <button type="button" class="mh-btn mh-btn--sm" data-action="batch-disable" ${state.busy ? "disabled" : ""}>${iconSvg("close", 13)}<span>${escapeHtml(t("batchDisable"))}</span></button>
+          <button type="button" class="mh-btn mh-btn--primary mh-btn--sm" data-action="batch-sync" ${state.busy ? "disabled" : ""}>${iconSvg("sync", 13)}<span>${escapeHtml(t("batchSync"))}</span></button>
+          <button type="button" class="mh-btn mh-btn--danger mh-btn--sm" data-action="batch-delete" ${state.busy ? "disabled" : ""}>${iconSvg("trash", 13)}<span>${escapeHtml(t("batchDelete"))}</span></button>
+        </div>
+      </div>
+    `;
+  };
+
   // -------------------------------------------------------------------------
-  // Probe & Tools Builders (supports targeted single-card & tools-only patch)
+  // Bento Card Status, Dock & Probe Builders (O(1) single-card patching!)
   // -------------------------------------------------------------------------
 
-  const renderHealthMeta = (serverName) => {
-    const probeState = state.probes.get(serverName);
+  const renderCardStatusMeta = (server) => {
+    const probeState = state.probes.get(server.name);
     const status = probeState?.data?.status;
+    const allDisabled = Object.values(server.instances ?? {}).every((inst) => inst.enabled === false);
+
     let dotCls = "";
     let badgeHtml = "";
     if (status === "ok") {
       dotCls = " is-ok";
-      badgeHtml = `<span class="mh-badge mh-badge--ok">${
-        probeState.data.toolCount !== undefined ? `${probeState.data.toolCount} tools` : "OK"
-      }</span>`;
+      const label =
+        probeState.data.toolCount !== undefined
+          ? t("cardStatusTools", { count: probeState.data.toolCount })
+          : t("cardStatusReady");
+      badgeHtml = `<span class="mh-badge mh-badge--ok">${escapeHtml(label)}</span>`;
     } else if (status === "auth_required") {
       dotCls = " is-auth";
-      badgeHtml = `<span class="mh-badge mh-badge--warn">OAuth</span>`;
+      badgeHtml = `<span class="mh-badge mh-badge--warn">${escapeHtml(t("cardStatusAuth"))}</span>`;
     } else if (status === "error") {
       dotCls = " is-error";
-      badgeHtml = `<span class="mh-badge mh-badge--err">ERR</span>`;
+      badgeHtml = `<span class="mh-badge mh-badge--err">${escapeHtml(t("cardStatusError"))}</span>`;
+    } else if (allDisabled) {
+      badgeHtml = `<span class="mh-badge">${escapeHtml(t("cardStatusDisabled"))}</span>`;
+    } else if (server.secretCount > 0 && !server.hasDrift) {
+      badgeHtml = `<span class="mh-badge" title="${escapeHtml(t("secretBadgeHint"))}">${iconSvg("shield", 11)}${escapeHtml(t("secretBadge", { count: server.secretCount }))}</span>`;
     }
-    return { dotCls, badgeHtml };
+
+    const isExpanded = state.expandedProbe.has(server.name);
+    let ctaLabel = t("cardActionProbe");
+    let ctaCls = "";
+    if (status === "auth_required") {
+      ctaLabel = t("cardActionAuth");
+      ctaCls = " is-warn";
+    } else if (status === "ok" && (probeState.data.toolCount ?? 0) > 0) {
+      ctaLabel = t("cardActionDebug");
+    }
+    const ctaHtml = `
+      <button
+        type="button"
+        class="mh-card-cta${ctaCls}${isExpanded ? " is-open" : ""}"
+        data-action="probe"
+        data-name="${escapeHtml(server.name)}"
+        title="${escapeHtml(t("probe"))}"
+      >${escapeHtml(ctaLabel)}</button>
+    `;
+
+    return { dotCls, badgeHtml, ctaHtml };
   };
 
   const renderToolsGridHtml = (serverName, tools) => {
@@ -938,10 +1262,20 @@ export function mountMcpHub(container, bridge) {
         ${visible
           .map(
             (tool) => `
-              <div class="mh-tool-item">
-                <span class="mh-tool-name">${escapeHtml(tool.name)}</span>
+              <button
+                type="button"
+                class="mh-tool-item"
+                data-action="open-tool"
+                data-server="${escapeHtml(serverName)}"
+                data-tool="${escapeHtml(tool.name)}"
+                title="${escapeHtml(t("toolClickHint"))}"
+              >
+                <div class="mh-tool-item-head">
+                  <span class="mh-tool-name">${escapeHtml(tool.name)}</span>
+                  <span class="mh-tool-run-hint">${iconSvg("play", 11)}</span>
+                </div>
                 ${tool.description ? `<span class="mh-tool-desc">${escapeHtml(tool.description)}</span>` : ""}
-              </div>
+              </button>
             `,
           )
           .join("")}
@@ -981,8 +1315,8 @@ export function mountMcpHub(container, bridge) {
       : "";
     const headerButtons = `
       <div style="display:inline-flex;align-items:center;gap:4px">
-        <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="reprobe" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("refresh"))}">${iconSvg("refresh", 13)}</button>
-        <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="close-probe" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("close"))}">${iconSvg("close", 13)}</button>
+        <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="reprobe" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("refresh"))}" aria-label="${escapeHtml(t("refresh"))}">${iconSvg("refresh", 13)}</button>
+        <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="close-probe" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("close"))}" aria-label="${escapeHtml(t("close"))}">${iconSvg("close", 13)}</button>
       </div>
     `;
 
@@ -1128,21 +1462,22 @@ export function mountMcpHub(container, bridge) {
     return `<div class="mh-probe-panel">${body}</div>`;
   };
 
-  /**
-   * Targeted single-card update — patches ONLY the affected card's health dot,
-   * probe badge, and inline probe panel without touching any sibling server cards.
-   */
   const patchServerCard = (serverName) => {
     if (state.activeTab !== "servers") return;
     const card = findCardEl(serverName);
     const server = findServer(serverName);
     if (!card || !server) return;
 
-    const { dotCls, badgeHtml } = renderHealthMeta(serverName);
+    const expanded = state.expandedProbe.has(serverName);
+    card.classList.toggle("is-expanded", expanded);
+
+    const { dotCls, badgeHtml, ctaHtml } = renderCardStatusMeta(server);
     const dotEl = card.querySelector("[data-health-dot]");
     if (dotEl) dotEl.className = `mh-health-dot${dotCls}`;
     const badgeSlot = card.querySelector("[data-probe-badge-slot]");
     if (badgeSlot) badgeSlot.innerHTML = badgeHtml;
+    const ctaSlot = card.querySelector("[data-card-cta-slot]");
+    if (ctaSlot) ctaSlot.innerHTML = ctaHtml;
     const probeSlot = card.querySelector("[data-probe-slot]");
     if (probeSlot) probeSlot.innerHTML = renderProbePanelHtml(server);
   };
@@ -1165,6 +1500,7 @@ export function mountMcpHub(container, bridge) {
   const renderMatrixPillsHtml = (server, harnessMap) =>
     HARNESS_ORDER.map((hid) => {
       const meta = harnessMap[hid];
+      const dockLabel = DOCK_LABELS[hid] ?? meta?.shortName ?? hid;
       const inst = server.instances[hid];
       if (!inst) {
         return `
@@ -1176,10 +1512,7 @@ export function mountMcpHub(container, bridge) {
             data-source="${escapeHtml(server.primaryHarnessId)}"
             data-target="${escapeHtml(hid)}"
             title="${escapeHtml(t("pillMissingHint", { harness: meta?.name ?? hid }))}"
-          >
-            ${iconSvg("plus", 11)}
-            <span>${escapeHtml(meta?.shortName ?? hid)}</span>
-          </button>
+          >+${escapeHtml(dockLabel)}</button>
         `;
       }
       const cls = inst.enabled ? "mh-pill--enabled" : "mh-pill--disabled";
@@ -1187,17 +1520,13 @@ export function mountMcpHub(container, bridge) {
       return `
         <button
           type="button"
-          class="mh-pill ${cls}"
-          style="--pill-accent:${escapeHtml(meta?.accent ?? "#2563eb")}"
+          class="mh-pill mh-pill--${escapeHtml(hid)} ${cls}"
           data-action="toggle-instance"
           data-name="${escapeHtml(server.name)}"
           data-harness="${escapeHtml(hid)}"
           data-next="${inst.enabled ? "false" : "true"}"
           title="${escapeHtml(t(hintKey, { harness: meta?.name ?? hid }))}"
-        >
-          <span class="mh-pill-dot"></span>
-          <span>${escapeHtml(meta?.shortName ?? hid)}</span>
-        </button>
+        >${escapeHtml(dockLabel)}</button>
       `;
     }).join("");
 
@@ -1209,14 +1538,19 @@ export function mountMcpHub(container, bridge) {
     const harnessMap = Object.fromEntries(harnesses.map((h) => [h.id, h]));
     const matrixSlot = card.querySelector("[data-matrix-slot]");
     const driftSlot = card.querySelector("[data-drift-slot]");
+    const badgeSlot = card.querySelector("[data-probe-badge-slot]");
     if (!matrixSlot) return false;
     matrixSlot.innerHTML = renderMatrixPillsHtml(server, harnessMap);
     if (driftSlot) driftSlot.innerHTML = renderDriftBadgeHtml(server);
+    if (badgeSlot) {
+      const { badgeHtml } = renderCardStatusMeta(server);
+      badgeSlot.innerHTML = badgeHtml;
+    }
     return true;
   };
 
   // -------------------------------------------------------------------------
-  // Content Tab Renderers
+  // Content Tab Renderers (Concept C Bento Gallery!)
   // -------------------------------------------------------------------------
 
   const renderServersTabHtml = () => {
@@ -1224,6 +1558,8 @@ export function mountMcpHub(container, bridge) {
     const rows = filteredServers();
     const harnesses = state.overview?.harnesses ?? [];
     const harnessMap = Object.fromEntries(harnesses.map((h) => [h.id, h]));
+    const presetMap = buildPresetMap();
+    const lang = resolveLocale(bridge.getLocale());
 
     if (allCount === 0) {
       return `
@@ -1249,59 +1585,116 @@ export function mountMcpHub(container, bridge) {
       `;
     }
 
+    const showDiscoverCard =
+      !state.search.trim() &&
+      !state.selectedHarness &&
+      state.transportFilter === "all" &&
+      !state.onlyDrift;
+    const presetCount = state.overview?.presets?.length ?? 12;
+
     return `
-      <div class="mh-list">
+      <div class="mh-bento-grid">
         ${rows
           .map((server) => {
             const isRemote = server.transport === "http" || server.transport === "sse";
             const endpoint = endpointSummary(server);
-            const { dotCls, badgeHtml } = renderHealthMeta(server.name);
+            const hostShort = compactHostSummary(server);
+            const visual = getMonogramVisual(server.name);
+            const matchedPreset = presetMap.get(server.name.toLowerCase());
+            const displayTitle = matchedPreset?.name ?? server.name;
+            const desc =
+              matchedPreset?.description?.[lang] ??
+              matchedPreset?.description?.en ??
+              (isRemote
+                ? t("cardDescRemote", { transport: server.transport.toUpperCase(), endpoint })
+                : t("cardDescStdio", { endpoint: shortenPath(endpoint) }));
+
+            const { dotCls, badgeHtml, ctaHtml } = renderCardStatusMeta(server);
+            const checked = state.selectedServers.has(server.name);
+            const expanded = state.expandedProbe.has(server.name);
 
             return `
-              <article class="mh-server-card" data-server="${escapeHtml(server.name)}">
-                <div class="mh-server-row">
-                  <div class="mh-server-meta">
-                    <div class="mh-server-head">
-                      <span class="mh-health-dot${dotCls}" data-health-dot></span>
-                      <span class="mh-server-name">${escapeHtml(server.name)}</span>
-                      <span class="mh-badge${isRemote ? " mh-badge--http" : ""}">${iconSvg(isRemote ? "globe" : "terminal", 11)}${escapeHtml(server.transport)}</span>
-                      <span data-drift-slot>${renderDriftBadgeHtml(server)}</span>
-                      <span data-probe-badge-slot>${badgeHtml}</span>
+              <article class="mh-server-card${checked ? " is-checked" : ""}${expanded ? " is-expanded" : ""}" data-server="${escapeHtml(server.name)}">
+                <div class="mh-bento-top">
+                  <div class="mh-bento-id">
+                    <div class="mh-squircle mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
+                    <div class="mh-bento-titles">
+                      <div class="mh-bento-name-row">
+                        <span class="mh-health-dot${dotCls}" data-health-dot></span>
+                        <h3 class="mh-bento-name" title="${escapeHtml(server.name)}">${escapeHtml(displayTitle)}</h3>
+                      </div>
+                      <div class="mh-bento-host" data-action="copy-text" data-text="${escapeHtml(endpoint)}" title="${escapeHtml(endpoint)}">${escapeHtml(hostShort)}</div>
                     </div>
-                    <div class="mh-server-endpoint" data-action="copy-text" data-text="${escapeHtml(endpoint)}" title="${escapeHtml(endpoint)}">${escapeHtml(endpoint)}</div>
                   </div>
-
-                  <div class="mh-matrix" data-matrix-slot aria-label="Harness presence">
-                    ${renderMatrixPillsHtml(server, harnessMap)}
-                  </div>
-
-                  <div class="mh-row-actions">
-                    <button type="button" class="mh-btn mh-btn--sm" data-action="probe" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("probe"))}">
-                      ${iconSvg("radar", 13)}<span>${escapeHtml(t("probe"))}</span>
-                    </button>
-                    <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="open-sync" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("sync"))}" aria-label="${escapeHtml(t("sync"))}">
-                      ${iconSvg("sync", 14)}
-                    </button>
-                    <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="open-edit" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("edit"))}" aria-label="${escapeHtml(t("edit"))}">
-                      ${iconSvg("edit", 14)}
-                    </button>
-                    <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="open-delete" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("remove"))}" aria-label="${escapeHtml(t("remove"))}">
-                      ${iconSvg("trash", 14)}
-                    </button>
+                  <div class="mh-bento-badges">
+                    <span data-drift-slot>${renderDriftBadgeHtml(server)}</span>
+                    <span data-probe-badge-slot>${badgeHtml}</span>
                   </div>
                 </div>
+
+                <p class="mh-bento-desc">${escapeHtml(desc)}</p>
+
+                <div class="mh-bento-dock">
+                  <div class="mh-client-dock" data-matrix-slot aria-label="Harness presence">
+                    ${renderMatrixPillsHtml(server, harnessMap)}
+                  </div>
+                  <div class="mh-card-foot">
+                    <div class="mh-card-meta-tags">
+                      <input type="checkbox" class="mh-card-check" data-select-server="${escapeHtml(server.name)}" aria-label="${escapeHtml(server.name)}" ${checked ? "checked" : ""} />
+                      <span class="mh-micro-tag">${iconSvg(isRemote ? "globe" : "terminal", 11)}${escapeHtml(server.transport)}</span>
+                      ${
+                        server.secretCount > 0 && (server.hasDrift || state.probes.get(server.name)?.data?.status)
+                          ? `<span class="mh-micro-tag" title="${escapeHtml(t("secretBadgeHint"))}">${iconSvg("shield", 11)}${server.secretCount}</span>`
+                          : ""
+                      }
+                    </div>
+                    <div class="mh-card-actions">
+                      <button type="button" class="mh-icon-btn" data-action="open-sync" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("sync"))}" aria-label="${escapeHtml(t("sync"))}">
+                        ${iconSvg("sync", 14)}
+                      </button>
+                      <button type="button" class="mh-icon-btn" data-action="open-edit" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("edit"))}" aria-label="${escapeHtml(t("edit"))}">
+                        ${iconSvg("edit", 14)}
+                      </button>
+                      <button type="button" class="mh-icon-btn mh-icon-btn--danger" data-action="open-delete" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("remove"))}" aria-label="${escapeHtml(t("remove"))}">
+                        ${iconSvg("trash", 14)}
+                      </button>
+                      <span data-card-cta-slot>${ctaHtml}</span>
+                    </div>
+                  </div>
+                </div>
+
                 <div data-probe-slot>${renderProbePanelHtml(server)}</div>
               </article>
             `;
           })
           .join("")}
+        ${
+          showDiscoverCard
+            ? `
+              <button type="button" class="mh-bento-discover" data-action="switch-tab" data-tab="presets">
+                <span class="mh-discover-plus" aria-hidden="true">${iconSvg("plus", 20)}</span>
+                <span class="mh-discover-title">${escapeHtml(t("discoverCardTitle"))}</span>
+                <span class="mh-discover-desc">${escapeHtml(t("discoverCardDesc", { count: presetCount }))}</span>
+              </button>
+            `
+            : ""
+        }
       </div>
     `;
   };
 
   const renderScopedTabHtml = () => {
-    const plugins = state.overview?.nativePlugins ?? [];
-    const scoped = state.overview?.scopedServers ?? [];
+    const q = state.search.trim().toLowerCase();
+    const plugins = (state.overview?.nativePlugins ?? []).filter((p) => {
+      if (state.selectedHarness && p.harnessId !== state.selectedHarness) return false;
+      if (q && !`${p.name} ${p.id} ${p.harnessId}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+    const scoped = (state.overview?.scopedServers ?? []).filter((s) => {
+      if (state.selectedHarness && s.harnessId !== state.selectedHarness) return false;
+      if (q && !`${s.name} ${s.scopeLabel} ${endpointSummary(s)}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
     const harnesses = state.overview?.harnesses ?? [];
     const harnessMap = Object.fromEntries(harnesses.map((h) => [h.id, h]));
 
@@ -1309,24 +1702,27 @@ export function mountMcpHub(container, bridge) {
       plugins.length === 0
         ? `<div class="mh-empty">${iconSvg("layers", 24)}<p>${escapeHtml(t("scopedPluginsEmpty"))}</p></div>`
         : `
-          <div class="mh-plugin-grid">
+          <div class="mh-bento-grid">
             ${plugins
               .map((p) => {
                 const h = harnessMap[p.harnessId];
+                const visual = getMonogramVisual(p.name);
                 return `
                   <div class="mh-plugin-card">
-                    <div class="mh-plugin-meta">
-                      <div class="mh-server-head">
-                        <span class="mh-dot" style="background:${escapeHtml(h?.accent ?? "#3b82f6")}"></span>
-                        <span class="mh-server-name">${escapeHtml(p.name)}</span>
-                        <span class="mh-badge">${escapeHtml(h?.shortName ?? p.harnessId)}</span>
-                        ${
-                          p.bundledMcps?.length
-                            ? `<span class="mh-badge mh-badge--http">${p.bundledMcps.length} MCP</span>`
-                            : ""
-                        }
+                    <div class="mh-plugin-left">
+                      <div class="mh-squircle mh-squircle--sm mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
+                      <div class="mh-plugin-meta">
+                        <div class="mh-plugin-head">
+                          <span class="mh-bento-name" style="font-size:14px">${escapeHtml(p.name)}</span>
+                          <span class="mh-badge">${escapeHtml(h?.shortName ?? p.harnessId)}</span>
+                          ${
+                            p.bundledMcps?.length
+                              ? `<span class="mh-badge mh-badge--http">${p.bundledMcps.length} MCP</span>`
+                              : ""
+                          }
+                        </div>
+                        <div class="mh-plugin-id" title="${escapeHtml(p.id)}">${escapeHtml(p.id)}</div>
                       </div>
-                      <div class="mh-harness-path" title="${escapeHtml(p.id)}">${escapeHtml(p.id)}</div>
                     </div>
                     <button
                       type="button"
@@ -1351,9 +1747,10 @@ export function mountMcpHub(container, bridge) {
       scoped.length === 0
         ? `<div class="mh-empty">${iconSvg("hub", 24)}<p>${escapeHtml(t("scopedMcpsEmpty"))}</p></div>`
         : `
-          <div class="mh-list">
+          <div class="mh-list-surface">
             ${scoped
-              .map((entry, idx) => {
+              .map((entry) => {
+                const realIdx = (state.overview?.scopedServers ?? []).indexOf(entry);
                 const h = harnessMap[entry.harnessId];
                 const isRemote = entry.transport === "http" || entry.transport === "sse";
                 const ep = endpointSummary(entry);
@@ -1370,7 +1767,7 @@ export function mountMcpHub(container, bridge) {
                       </div>
                       <div class="mh-backup-sub">${escapeHtml(shortenPath(entry.scopeLabel))} · ${escapeHtml(ep)}</div>
                     </div>
-                    <button type="button" class="mh-btn mh-btn--sm" data-action="promote-scoped" data-scoped-idx="${idx}">
+                    <button type="button" class="mh-btn mh-btn--sm" data-action="promote-scoped" data-scoped-idx="${realIdx}">
                       ${iconSvg("bolt", 13)}<span>${escapeHtml(t("promoteToGlobal"))}</span>
                     </button>
                   </div>
@@ -1381,7 +1778,7 @@ export function mountMcpHub(container, bridge) {
         `;
 
     return `
-      <div style="display:flex;flex-direction:column;gap:22px">
+      <div style="display:flex;flex-direction:column;gap:24px">
         <section class="mh-section">
           <div class="mh-section-head">
             <h2 class="mh-section-title">${escapeHtml(t("scopedPluginsTitle"))}</h2>
@@ -1416,8 +1813,7 @@ export function mountMcpHub(container, bridge) {
     }
 
     return `
-      <p class="mh-hint" style="margin-bottom:10px">${escapeHtml(t("presetsHint"))}</p>
-      <div class="mh-presets-grid">
+      <div class="mh-bento-grid">
         ${presets
           .map((preset) => {
             const isRemote = preset.transport === "http" || preset.transport === "sse";
@@ -1426,26 +1822,32 @@ export function mountMcpHub(container, bridge) {
             const targetPreview = isRemote
               ? preset.url
               : [preset.command, ...(preset.args ?? [])].join(" ");
+            const hostShort = compactHostSummary(preset);
+            const visual = getMonogramVisual(preset.id);
+
             return `
-              <div class="mh-preset-card">
-                <div>
-                  <div class="mh-preset-head">
-                    <span class="mh-preset-title">${escapeHtml(preset.name)}</span>
-                    <div style="display:flex;gap:5px;align-items:center">
-                      ${preset.oauthHint ? `<span class="mh-badge mh-badge--warn">${escapeHtml(t("oauthBadge"))}</span>` : ""}
-                      ${isInstalled ? `<span class="mh-badge mh-badge--ok">${escapeHtml(t("installedBadge"))}</span>` : ""}
+              <article class="mh-preset-card">
+                <div class="mh-bento-top">
+                  <div class="mh-bento-id">
+                    <div class="mh-squircle mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
+                    <div class="mh-bento-titles">
+                      <h3 class="mh-bento-name">${escapeHtml(preset.name)}</h3>
+                      <div class="mh-bento-host" data-action="copy-text" data-text="${escapeHtml(targetPreview)}" title="${escapeHtml(targetPreview)}">${escapeHtml(hostShort)}</div>
                     </div>
                   </div>
-                  <p class="mh-preset-desc">${escapeHtml(desc)}</p>
+                  <div class="mh-bento-badges">
+                    ${preset.oauthHint ? `<span class="mh-badge mh-badge--warn">${escapeHtml(t("oauthBadge"))}</span>` : ""}
+                    ${isInstalled ? `<span class="mh-badge mh-badge--ok">${escapeHtml(t("installedBadge"))}</span>` : ""}
+                  </div>
                 </div>
-                <div class="mh-server-endpoint" data-action="copy-text" data-text="${escapeHtml(targetPreview)}" title="${escapeHtml(targetPreview)}">${escapeHtml(targetPreview)}</div>
+                <p class="mh-bento-desc">${escapeHtml(desc)}</p>
                 <div class="mh-preset-footer">
-                  <span class="mh-badge${isRemote ? " mh-badge--http" : ""}">${escapeHtml(preset.transport)}</span>
+                  <span class="mh-micro-tag">${iconSvg(isRemote ? "globe" : "terminal", 11)}${escapeHtml(preset.transport)}</span>
                   <button type="button" class="mh-btn mh-btn--sm${isInstalled ? "" : " mh-btn--primary"}" data-action="use-preset" data-preset="${escapeHtml(preset.id)}">
                     ${iconSvg("plus", 13)}<span>${escapeHtml(t("usePreset"))}</span>
                   </button>
                 </div>
-              </div>
+              </article>
             `;
           })
           .join("")}
@@ -1454,7 +1856,15 @@ export function mountMcpHub(container, bridge) {
   };
 
   const renderBackupsTabHtml = () => {
-    const backups = state.overview?.backups ?? [];
+    if (state.backupsLoading && !state.backupsLoaded) {
+      return `<div class="mh-empty"><p>${escapeHtml(t("loading"))}</p></div>`;
+    }
+    const q = state.search.trim().toLowerCase();
+    const backups = (state.overview?.backups ?? []).filter((b) => {
+      if (state.selectedHarness && b.harnessId !== state.selectedHarness) return false;
+      if (q && !`${b.harnessId} ${b.reason} ${b.configPath}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
     const harnesses = state.overview?.harnesses ?? [];
     const harnessMap = Object.fromEntries(harnesses.map((h) => [h.id, h]));
     const lang = resolveLocale(bridge.getLocale());
@@ -1469,25 +1879,31 @@ export function mountMcpHub(container, bridge) {
     }
 
     return `
-      <p class="mh-hint" style="margin-bottom:10px">${escapeHtml(t("backupsHint"))}</p>
-      <div class="mh-list">
+      <p class="mh-hint" style="margin-bottom:12px">${escapeHtml(t("backupsHint"))}</p>
+      <div class="mh-list-surface">
         ${backups
           .map((b) => {
             const h = harnessMap[b.harnessId];
+            const hName = h?.name ?? b.harnessId;
             return `
               <div class="mh-backup-row">
                 <div class="mh-backup-info">
                   <div class="mh-backup-title">
                     <span class="mh-dot" style="background:${escapeHtml(h?.accent ?? "#64748b")}"></span>
-                    <span>${escapeHtml(h?.name ?? b.harnessId)}</span>
+                    <span>${escapeHtml(hName)}</span>
                     <span class="mh-badge">${escapeHtml(b.reason)}</span>
                     <span class="mh-hint">${escapeHtml(formatTime(b.createdAt, lang))} · ${escapeHtml(formatBytes(b.sizeBytes))}</span>
                   </div>
                   <div class="mh-backup-sub">${escapeHtml(shortenPath(b.configPath))}</div>
                 </div>
-                <button type="button" class="mh-btn mh-btn--sm" data-action="restore-backup" data-backup="${escapeHtml(b.id)}" data-harness="${escapeHtml(h?.name ?? b.harnessId)}">
-                  ${iconSvg("history", 13)}<span>${escapeHtml(t("restore"))}</span>
-                </button>
+                <div style="display:flex;align-items:center;gap:6px">
+                  <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="preview-backup" data-backup="${escapeHtml(b.id)}" data-harness="${escapeHtml(hName)}">
+                    ${iconSvg("file", 13)}<span>${escapeHtml(t("backupPreview"))}</span>
+                  </button>
+                  <button type="button" class="mh-btn mh-btn--sm" data-action="restore-backup" data-backup="${escapeHtml(b.id)}" data-harness="${escapeHtml(hName)}">
+                    ${iconSvg("history", 13)}<span>${escapeHtml(t("restore"))}</span>
+                  </button>
+                </div>
               </div>
             `;
           })
@@ -1531,14 +1947,17 @@ export function mountMcpHub(container, bridge) {
       : "";
     slots.footer.innerHTML = `
       <div class="mh-footer-note">
-        <span class="mh-footer-left">${iconSvg("check", 14)}<span>${escapeHtml(t("reloadHint"))}</span></span>
-        ${perfHtml}
+        <span class="mh-footer-left" title="${escapeHtml(t("shortcutsHint"))}">${iconSvg("check", 14)}<span>${escapeHtml(t("reloadHint"))}</span></span>
+        <div class="mh-footer-right">
+          <span class="mh-live-pill"><span class="mh-live-dot"></span>${escapeHtml(t("liveSyncTag"))}</span>
+          ${perfHtml}
+        </div>
       </div>
     `;
   };
 
   // -------------------------------------------------------------------------
-  // Slide-over Editor Drawer Renderer
+  // Slide-over Drawer Renderer (Editor mode + Interactive Tool Playground mode)
   // -------------------------------------------------------------------------
 
   const renderDrawer = () => {
@@ -1548,6 +1967,92 @@ export function mountMcpHub(container, bridge) {
       return;
     }
     const prevBodyScroll = slots.drawer.querySelector(".mh-modal-body")?.scrollTop ?? 0;
+
+    if (d.mode === "tool") {
+      const fields = d.tool.inputSchema?.fields ?? [];
+      const res = d.result;
+      slots.drawer.innerHTML = `
+        <div class="mh-drawer-backdrop" data-action="close-drawer-backdrop">
+          <aside class="mh-drawer" role="dialog" aria-modal="true" aria-label="${escapeHtml(t("toolDrawerTitle"))}">
+            <div class="mh-modal-head">
+              <h2 class="mh-modal-title">${escapeHtml(t("toolDrawerTitle"))} · ${escapeHtml(d.tool.name)}</h2>
+              <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="close-drawer" aria-label="${escapeHtml(t("close"))}">${iconSvg("close", 15)}</button>
+            </div>
+            <div class="mh-drawer-subbar">
+              <span class="mh-badge mh-badge--http">${escapeHtml(d.serverName)}</span>
+              <span class="mh-hint">${escapeHtml(d.tool.description || "")}</span>
+            </div>
+            <div class="mh-modal-body">
+              <div class="mh-field">
+                <span class="mh-label">${escapeHtml(t("toolParamsTitle"))}</span>
+                ${
+                  fields.length === 0
+                    ? `<p class="mh-hint">${escapeHtml(t("toolNoParams"))}</p>`
+                    : `
+                      <div class="mh-param-list">
+                        ${fields
+                          .map(
+                            (f) => `
+                              <div class="mh-param-row">
+                                <div class="mh-param-head">
+                                  <span class="mh-param-name">${escapeHtml(f.name)}</span>
+                                  <span class="mh-badge">${escapeHtml(f.type)}</span>
+                                  ${f.required ? `<span class="mh-badge mh-badge--warn">${escapeHtml(t("toolRequired"))}</span>` : ""}
+                                </div>
+                                ${f.description ? `<span class="mh-hint">${escapeHtml(f.description)}</span>` : ""}
+                              </div>
+                            `,
+                          )
+                          .join("")}
+                      </div>
+                    `
+                }
+              </div>
+              <div class="mh-field">
+                <label class="mh-label" for="mh-tool-args">${escapeHtml(t("toolArgsJson"))}</label>
+                <textarea id="mh-tool-args" class="mh-textarea" style="min-height:110px" data-tool-args>${escapeHtml(d.argsText)}</textarea>
+              </div>
+              ${d.error ? `<div class="mh-error-banner">${escapeHtml(d.error)}</div>` : ""}
+              ${
+                res
+                  ? `
+                    <div class="mh-code-block">
+                      <div class="mh-code-head">
+                        <span style="display:inline-flex;align-items:center;gap:7px">
+                          <span class="mh-badge ${res.ok ? "mh-badge--ok" : "mh-badge--err"}">${res.ok ? "OK" : "ERR"}</span>
+                          <span>${escapeHtml(t("toolResultTitle"))}</span>
+                          <span class="mh-hint">${res.latencyMs ?? 0} ms</span>
+                        </span>
+                        ${
+                          res.rawText
+                            ? `<button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="copy-text" data-text="${escapeHtml(res.rawText)}">${iconSvg("copy", 13)}<span>${escapeHtml(t("copy"))}</span></button>`
+                            : ""
+                        }
+                      </div>
+                      ${res.errorMessage && !res.ok ? `<div class="mh-error-banner" style="margin:10px">${escapeHtml(res.errorMessage)}</div>` : ""}
+                      ${res.rawText ? `<pre class="mh-code-pre">${escapeHtml(res.rawText)}</pre>` : ""}
+                      ${res.truncated ? `<p class="mh-hint" style="padding:0 12px 10px">${escapeHtml(t("toolTruncated"))}</p>` : ""}
+                    </div>
+                  `
+                  : ""
+              }
+            </div>
+            <div class="mh-modal-foot">
+              <div class="mh-modal-foot-right">
+                <button type="button" class="mh-btn" data-action="close-drawer">${escapeHtml(t("close"))}</button>
+                <button type="button" class="mh-btn mh-btn--primary" data-action="tool-run" ${d.running ? "disabled" : ""}>
+                  ${iconSvg("play", 13)}<span>${escapeHtml(d.running ? t("toolRunning") : t("toolRun"))}</span>
+                </button>
+              </div>
+            </div>
+          </aside>
+        </div>
+      `;
+      const nextBody = slots.drawer.querySelector(".mh-modal-body");
+      if (nextBody) nextBody.scrollTop = prevBodyScroll;
+      return;
+    }
+
     const harnesses = state.overview?.harnesses ?? [];
     const harnessMap = Object.fromEntries(harnesses.map((h) => [h.id, h]));
     const isRemote = d.transport === "http" || d.transport === "sse";
@@ -1693,7 +2198,7 @@ export function mountMcpHub(container, bridge) {
             <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="close-drawer" aria-label="${escapeHtml(t("close"))}">${iconSvg("close", 15)}</button>
           </div>
           <div class="mh-drawer-subbar">
-            <div class="mh-tabs" role="tablist">
+            <div class="mh-seg-tabs" role="tablist">
               <button type="button" role="tab" aria-selected="${d.activeTab === "form"}" class="mh-tab${d.activeTab === "form" ? " is-active" : ""}" data-action="drawer-tab" data-tab="form">
                 ${iconSvg("edit", 13)}<span>${escapeHtml(t("drawerTabForm"))}</span>
               </button>
@@ -1740,7 +2245,7 @@ export function mountMcpHub(container, bridge) {
   };
 
   // -------------------------------------------------------------------------
-  // Modal Renderer (Sync + Drift Diff, Delete, Import, Export, Confirm)
+  // Modal Renderer
   // -------------------------------------------------------------------------
 
   const renderModal = () => {
@@ -1827,6 +2332,45 @@ export function mountMcpHub(container, bridge) {
               <div class="mh-modal-foot-right">
                 <button type="button" class="mh-btn" data-action="close-modal">${escapeHtml(t("cancel"))}</button>
                 <button type="button" class="mh-btn mh-btn--primary" data-action="submit-sync" ${state.busy ? "disabled" : ""}>${iconSvg("sync", 14)}<span>${escapeHtml(t("syncSubmit"))}</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    if (m.type === "batch-sync") {
+      slots.modal.innerHTML = `
+        <div class="mh-backdrop" data-action="close-modal-backdrop">
+          <div class="mh-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(t("batchSyncTitle", { count: m.names.length }))}">
+            <div class="mh-modal-head">
+              <h2 class="mh-modal-title">${escapeHtml(t("batchSyncTitle", { count: m.names.length }))}</h2>
+              <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="close-modal" aria-label="${escapeHtml(t("close"))}">${iconSvg("close", 15)}</button>
+            </div>
+            <div class="mh-modal-body">
+              <p class="mh-hint">${escapeHtml(m.names.join(" · "))}</p>
+              <div class="mh-field">
+                <span class="mh-label">${escapeHtml(t("syncTargets"))}</span>
+                <div class="mh-check-grid">
+                  ${harnesses
+                    .map(
+                      (h) => `
+                        <label class="mh-check-item">
+                          <input type="checkbox" data-modal-target="${escapeHtml(h.id)}" ${m.targets.has(h.id) ? "checked" : ""} />
+                          <span class="mh-dot" style="background:${escapeHtml(h.accent)}"></span>
+                          <span>${escapeHtml(h.name)}</span>
+                        </label>
+                      `,
+                    )
+                    .join("")}
+                </div>
+              </div>
+            </div>
+            <div class="mh-modal-foot">
+              <div class="mh-modal-foot-right">
+                <button type="button" class="mh-btn" data-action="close-modal">${escapeHtml(t("cancel"))}</button>
+                <button type="button" class="mh-btn mh-btn--primary" data-action="submit-batch-sync" ${state.busy ? "disabled" : ""}>${iconSvg("sync", 14)}<span>${escapeHtml(t("syncSubmit"))}</span></button>
               </div>
             </div>
           </div>
@@ -1924,12 +2468,50 @@ export function mountMcpHub(container, bridge) {
             </div>
             <div class="mh-modal-body">
               <p class="mh-hint">${escapeHtml(t("modalExportHint"))}</p>
-              <textarea class="mh-textarea" style="min-height:260px" readonly>${escapeHtml(m.json)}</textarea>
+              <label class="mh-check-item" style="width:fit-content">
+                <input type="checkbox" data-export-redact ${m.redactSecrets ? "checked" : ""} />
+                ${iconSvg("shield", 14)}
+                <span>${escapeHtml(t("exportRedactLabel"))}</span>
+              </label>
+              <p class="mh-hint">${escapeHtml(t("exportRedactHint"))}</p>
+              <textarea class="mh-textarea" style="min-height:240px" readonly>${escapeHtml(m.json)}</textarea>
             </div>
             <div class="mh-modal-foot">
               <div class="mh-modal-foot-right">
                 <button type="button" class="mh-btn" data-action="close-modal">${escapeHtml(t("close"))}</button>
                 <button type="button" class="mh-btn mh-btn--primary" data-action="copy-text" data-text="${escapeHtml(m.json)}">${iconSvg("copy", 14)}<span>${escapeHtml(t("copy"))} JSON</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
+    if (m.type === "backup-preview") {
+      const lang = resolveLocale(bridge.getLocale());
+      slots.modal.innerHTML = `
+        <div class="mh-backdrop" data-action="close-modal-backdrop">
+          <div class="mh-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(t("backupPreviewTitle"))}">
+            <div class="mh-modal-head">
+              <h2 class="mh-modal-title">${escapeHtml(t("backupPreviewTitle"))} · ${escapeHtml(m.harnessName)}</h2>
+              <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="close-modal" aria-label="${escapeHtml(t("close"))}">${iconSvg("close", 15)}</button>
+            </div>
+            <div class="mh-modal-body">
+              <p class="mh-hint">${escapeHtml(shortenPath(m.data.configPath))} · ${escapeHtml(m.data.reason)} · ${escapeHtml(formatTime(m.data.createdAt, lang))} · ${escapeHtml(formatBytes(m.data.sizeBytes))}</p>
+              ${m.data.truncated ? `<div class="mh-error-banner">${escapeHtml(t("backupTruncated"))}</div>` : ""}
+              <div class="mh-code-block">
+                <div class="mh-code-head">
+                  <span>${escapeHtml(m.data.id)}</span>
+                  <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="copy-text" data-text="${escapeHtml(m.data.content)}">${iconSvg("copy", 13)}<span>${escapeHtml(t("copy"))}</span></button>
+                </div>
+                <pre class="mh-code-pre">${escapeHtml(m.data.content)}</pre>
+              </div>
+            </div>
+            <div class="mh-modal-foot">
+              <div class="mh-modal-foot-right">
+                <button type="button" class="mh-btn" data-action="close-modal">${escapeHtml(t("close"))}</button>
+                <button type="button" class="mh-btn mh-btn--primary" data-action="restore-backup" data-backup="${escapeHtml(m.backupId)}" data-harness="${escapeHtml(m.harnessName)}">${iconSvg("history", 14)}<span>${escapeHtml(t("restore"))}</span></button>
               </div>
             </div>
           </div>
@@ -1963,9 +2545,10 @@ export function mountMcpHub(container, bridge) {
 
   const renderAll = () => {
     renderHeader();
-    renderRail();
-    renderToolbar();
+    renderNavBar();
+    renderSubbar();
     renderContent();
+    renderBatchBar();
     renderFooter();
     renderDrawer();
     renderModal();
@@ -1973,35 +2556,31 @@ export function mountMcpHub(container, bridge) {
   };
 
   // -------------------------------------------------------------------------
-  // Persistent Search Input Listeners (IME-safe + Debounced)
+  // Persistent Search Input Listeners (IME-safe, zero focus loss!)
   // -------------------------------------------------------------------------
 
   const scheduleSearchRender = () => {
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = setTimeout(() => {
       searchDebounceTimer = null;
-      if (!disposed) renderContent();
+      if (!disposed) {
+        renderSubbar();
+        renderContent();
+      }
     }, SEARCH_DEBOUNCE_MS);
   };
 
-  slots.searchInput.addEventListener(
-    "compositionstart",
-    () => {
-      isComposingSearch = true;
-    },
-    { signal },
-  );
-
+  slots.searchInput.addEventListener("compositionstart", () => { isComposingSearch = true; }, { signal });
   slots.searchInput.addEventListener(
     "compositionend",
     () => {
       isComposingSearch = false;
       state.search = slots.searchInput.value;
+      renderSubbar();
       renderContent();
     },
     { signal },
   );
-
   slots.searchInput.addEventListener(
     "input",
     () => {
@@ -2019,7 +2598,7 @@ export function mountMcpHub(container, bridge) {
     "input",
     (event) => {
       const target = event.target;
-      if (!(target instanceof doc.defaultView.HTMLElement)) return;
+      if (!(target instanceof win.HTMLElement)) return;
       if (target === slots.searchInput) return;
 
       if (target.dataset.toolSearch) {
@@ -2035,7 +2614,12 @@ export function mountMcpHub(container, bridge) {
         return;
       }
 
-      if (state.drawer) {
+      if (state.drawer?.mode === "tool" && target.hasAttribute("data-tool-args")) {
+        state.drawer.argsText = target.value;
+        return;
+      }
+
+      if (state.drawer?.mode === "editor") {
         if (target.dataset.drawerField && target.type !== "checkbox" && target.tagName !== "SELECT") {
           state.drawer[target.dataset.drawerField] = target.value;
           return;
@@ -2063,20 +2647,50 @@ export function mountMcpHub(container, bridge) {
     "change",
     (event) => {
       const target = event.target;
-      if (!(target instanceof doc.defaultView.HTMLElement)) return;
+      if (!(target instanceof win.HTMLElement)) return;
 
-      if (state.drawer) {
+      if (target.hasAttribute("data-select-all-visible")) {
+        const rows = filteredServers();
+        if (target.checked) {
+          for (const r of rows) state.selectedServers.add(r.name);
+        } else {
+          for (const r of rows) state.selectedServers.delete(r.name);
+        }
+        renderSubbar();
+        renderContent();
+        renderBatchBar();
+        return;
+      }
+
+      if (target.dataset.selectServer) {
+        const name = target.dataset.selectServer;
+        if (target.checked) state.selectedServers.add(name);
+        else state.selectedServers.delete(name);
+        const card = findCardEl(name);
+        if (card) card.classList.toggle("is-checked", target.checked);
+        const selectAllEl = slots.subbar.querySelector("[data-select-all-visible]");
+        if (selectAllEl) {
+          const rows = filteredServers();
+          selectAllEl.checked = rows.length > 0 && rows.every((r) => state.selectedServers.has(r.name));
+        }
+        renderBatchBar();
+        return;
+      }
+
+      if (target.hasAttribute("data-export-redact") && state.modal?.type === "export") {
+        openExportModal(Boolean(target.checked));
+        return;
+      }
+
+      if (state.drawer?.mode === "editor") {
         if (target.hasAttribute("data-drawer-source")) {
           const hid = target.value;
           const inst = state.drawer.editServer?.instances?.[hid];
           if (inst) {
             state.drawer.sourceHarnessId = hid;
             loadDrawerInstanceValues(state.drawer, inst);
-            if (state.drawer.activeTab === "preview") {
-              refreshDrawerPreview();
-            } else {
-              renderDrawer();
-            }
+            if (state.drawer.activeTab === "preview") refreshDrawerPreview();
+            else renderDrawer();
           }
           return;
         }
@@ -2117,19 +2731,49 @@ export function mountMcpHub(container, bridge) {
     { signal },
   );
 
-  // Global Escape handler on document so closing drawer/modal works even after inner DOM updates.
+  // Global keyboard shortcuts (Escape, / Search, N New, R Refresh).
   doc.addEventListener(
     "keydown",
     (event) => {
-      if (event.key !== "Escape") return;
-      if (state.modal) {
+      if (event.key === "Escape") {
+        if (state.modal) {
+          event.preventDefault();
+          state.modal = null;
+          renderModal();
+        } else if (state.drawer) {
+          event.preventDefault();
+          state.drawer = null;
+          renderDrawer();
+        } else if (state.selectedServers.size > 0) {
+          event.preventDefault();
+          state.selectedServers.clear();
+          renderSubbar();
+          renderContent();
+          renderBatchBar();
+        }
+        return;
+      }
+
+      if (state.modal || state.drawer) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (isEditableTarget(doc.activeElement)) return;
+
+      if (event.key === "/") {
         event.preventDefault();
-        state.modal = null;
-        renderModal();
-      } else if (state.drawer) {
+        slots.searchInput.focus();
+        slots.searchInput.select();
+        return;
+      }
+
+      if ((event.key === "n" || event.key === "N") && state.overview && !state.busy) {
         event.preventDefault();
-        state.drawer = null;
-        renderDrawer();
+        openEditorDrawer(null);
+        return;
+      }
+
+      if ((event.key === "r" || event.key === "R") && state.overview && !state.busy) {
+        event.preventDefault();
+        loadOverview(true);
       }
     },
     { signal },
@@ -2139,9 +2783,9 @@ export function mountMcpHub(container, bridge) {
     "keydown",
     (event) => {
       const target = event.target;
-      if (!(target instanceof doc.defaultView.HTMLElement)) return;
+      if (!(target instanceof win.HTMLElement)) return;
 
-      if (event.key === "Enter" && target.dataset.drawerField === "quickCmd" && state.drawer) {
+      if (event.key === "Enter" && target.dataset.drawerField === "quickCmd" && state.drawer?.mode === "editor") {
         event.preventDefault();
         const tokens = tokenizeCommandLine(state.drawer.quickCmd);
         if (tokens.length > 0) {
@@ -2150,15 +2794,6 @@ export function mountMcpHub(container, bridge) {
           state.drawer.quickCmd = "";
           renderDrawer();
         }
-        return;
-      }
-
-      if ((event.key === "Enter" || event.key === " ") && target.dataset.action === "filter-harness") {
-        event.preventDefault();
-        const hid = target.dataset.harness;
-        state.selectedHarness = state.selectedHarness === hid ? null : hid;
-        renderRail();
-        if (state.activeTab === "servers") renderContent();
       }
     },
     { signal },
@@ -2168,7 +2803,7 @@ export function mountMcpHub(container, bridge) {
     "click",
     async (event) => {
       const origin = event.target;
-      if (!(origin instanceof doc.defaultView.Element)) return;
+      if (!(origin instanceof win.Element)) return;
       const el = origin.closest("[data-action]");
       if (!el) return;
 
@@ -2181,7 +2816,6 @@ export function mountMcpHub(container, bridge) {
         }
         return;
       }
-
       if (action === "close-drawer-backdrop") {
         if (origin === el) {
           state.drawer = null;
@@ -2189,13 +2823,11 @@ export function mountMcpHub(container, bridge) {
         }
         return;
       }
-
       if (action === "close-modal") {
         state.modal = null;
         renderModal();
         return;
       }
-
       if (action === "close-drawer") {
         state.drawer = null;
         renderDrawer();
@@ -2216,8 +2848,14 @@ export function mountMcpHub(container, bridge) {
         const nextTab = el.dataset.tab;
         if (nextTab && nextTab !== state.activeTab) {
           state.activeTab = nextTab;
-          renderToolbar();
+          renderHeader();
+          renderNavBar();
+          renderSubbar();
           renderContent();
+          renderBatchBar();
+          if (nextTab === "backups") {
+            ensureBackupsLoaded(false);
+          }
         }
         return;
       }
@@ -2225,30 +2863,91 @@ export function mountMcpHub(container, bridge) {
       if (action === "filter-harness") {
         const hid = el.dataset.harness;
         state.selectedHarness = state.selectedHarness === hid ? null : hid;
-        renderRail();
-        if (state.activeTab === "servers") renderContent();
+        renderNavBar();
+        renderSubbar();
+        renderContent();
+        return;
+      }
+
+      if (action === "clear-harness-filter") {
+        state.selectedHarness = null;
+        renderNavBar();
+        renderSubbar();
+        renderContent();
         return;
       }
 
       if (action === "filter-transport") {
         state.transportFilter = el.dataset.value;
         if (state.transportFilter === "all") state.onlyDrift = false;
-        renderToolbar();
+        renderSubbar();
         renderContent();
         return;
       }
 
       if (action === "toggle-drift") {
         state.onlyDrift = !state.onlyDrift;
-        renderToolbar();
+        renderSubbar();
         renderContent();
         return;
       }
 
       if (action === "filter-preset-cat") {
         state.presetCategory = el.dataset.value;
-        renderToolbar();
+        renderSubbar();
         renderContent();
+        return;
+      }
+
+      // Batch actions
+      if (action === "batch-select-all") {
+        for (const s of filteredServers()) state.selectedServers.add(s.name);
+        renderSubbar();
+        renderContent();
+        renderBatchBar();
+        return;
+      }
+      if (action === "batch-clear") {
+        state.selectedServers.clear();
+        renderSubbar();
+        renderContent();
+        renderBatchBar();
+        return;
+      }
+      if (action === "batch-enable" || action === "batch-disable") {
+        const names = [...state.selectedServers];
+        if (names.length === 0) return;
+        const enabled = action === "batch-enable";
+        state.selectedServers.clear();
+        await invokeWithOverview(
+          "server.batchToggle",
+          { names, enabled },
+          t("toastBatchUpdated", { count: names.length }),
+        );
+        return;
+      }
+      if (action === "batch-sync") {
+        openBatchSyncModal();
+        return;
+      }
+      if (action === "batch-delete") {
+        const names = [...state.selectedServers];
+        if (names.length === 0) return;
+        openConfirmModal({
+          title: t("batchDeleteTitle", { count: names.length }),
+          message: t("batchDeleteConfirm", { count: names.length }),
+          danger: true,
+          onConfirm: async () => {
+            state.modal = null;
+            renderModal();
+            state.selectedServers.clear();
+            await invokeWithOverview(
+              "server.batchDelete",
+              { names, targets: HARNESS_ORDER },
+              t("toastBatchDeleted", { count: names.length }),
+            );
+          },
+        });
         return;
       }
 
@@ -2256,32 +2955,31 @@ export function mountMcpHub(container, bridge) {
         openEditorDrawer(null);
         return;
       }
-
       if (action === "open-edit") {
         const server = findServer(el.dataset.name);
         if (server) openEditorDrawer(null, { editServer: server });
         return;
       }
-
+      if (action === "open-tool") {
+        openToolDrawer(el.dataset.server, el.dataset.tool);
+        return;
+      }
       if (action === "open-sync") {
         const server = findServer(el.dataset.name);
         if (server) openSyncModal(server);
         return;
       }
-
       if (action === "open-delete") {
         const server = findServer(el.dataset.name);
         if (server) openDeleteModal(server);
         return;
       }
-
       if (action === "open-import") {
         openImportModal();
         return;
       }
-
       if (action === "open-export") {
-        await openExportModal();
+        await openExportModal(true);
         return;
       }
 
@@ -2493,17 +3191,51 @@ export function mountMcpHub(container, bridge) {
         return;
       }
 
-      // Drawer actions
-      if (state.drawer) {
+      // Tool Playground runner action
+      if (state.drawer?.mode === "tool" && action === "tool-run") {
+        let parsedArgs = {};
+        try {
+          const raw = state.drawer.argsText.trim();
+          parsedArgs = raw ? JSON.parse(raw) : {};
+          if (!parsedArgs || typeof parsedArgs !== "object" || Array.isArray(parsedArgs)) {
+            throw new Error("Expected JSON object");
+          }
+        } catch {
+          state.drawer.error = t("toolInvalidJson");
+          renderDrawer();
+          return;
+        }
+        state.drawer.running = true;
+        state.drawer.error = null;
+        renderDrawer();
+        try {
+          const res = await invoke("server.callTool", {
+            name: state.drawer.serverName,
+            harnessId: state.selectedHarness,
+            toolName: state.drawer.tool.name,
+            arguments: parsedArgs,
+          });
+          if (disposed || signal.aborted || state.drawer?.mode !== "tool") return;
+          state.drawer.running = false;
+          state.drawer.result = res;
+          renderDrawer();
+        } catch (error) {
+          if (disposed || signal.aborted || state.drawer?.mode !== "tool") return;
+          state.drawer.running = false;
+          state.drawer.error = error instanceof Error ? error.message : String(error);
+          renderDrawer();
+        }
+        return;
+      }
+
+      // Editor drawer actions
+      if (state.drawer?.mode === "editor") {
         if (action === "drawer-tab") {
           const nextTab = el.dataset.tab;
           if (nextTab && nextTab !== state.drawer.activeTab) {
             state.drawer.activeTab = nextTab;
-            if (nextTab === "preview") {
-              await refreshDrawerPreview();
-            } else {
-              renderDrawer();
-            }
+            if (nextTab === "preview") await refreshDrawerPreview();
+            else renderDrawer();
           }
           return;
         }
@@ -2625,6 +3357,20 @@ export function mountMcpHub(container, bridge) {
           return;
         }
 
+        if (action === "submit-batch-sync" && state.modal.type === "batch-sync") {
+          const targets = [...state.modal.targets];
+          const names = [...state.modal.names];
+          state.modal = null;
+          renderModal();
+          state.selectedServers.clear();
+          await invokeWithOverview(
+            "server.batchSync",
+            { names, targets },
+            t("toastBatchSynced", { count: names.length }),
+          );
+          return;
+        }
+
         if (action === "submit-delete" && state.modal.type === "delete") {
           const targets = [...state.modal.targets];
           const name = state.modal.server.name;
@@ -2665,6 +3411,11 @@ export function mountMcpHub(container, bridge) {
         }
       }
 
+      if (action === "preview-backup") {
+        await openBackupPreviewModal(el.dataset.backup, el.dataset.harness);
+        return;
+      }
+
       if (action === "restore-backup") {
         const backupId = el.dataset.backup;
         const harnessName = el.dataset.harness;
@@ -2686,7 +3437,7 @@ export function mountMcpHub(container, bridge) {
     { signal },
   );
 
-  // Silent foreground auto-refresh when tab becomes visible (stat-cached on backend).
+  // Silent foreground auto-refresh when tab becomes visible.
   doc.addEventListener(
     "visibilitychange",
     () => {
@@ -2706,6 +3457,9 @@ export function mountMcpHub(container, bridge) {
     { signal },
   );
 
+  // Lightweight 0-I/O live revision poll for external CLI edits.
+  livePollTimer = setInterval(pollLiveChanges, LIVE_POLL_INTERVAL_MS);
+
   const offLocale = bridge.onLocaleChange?.(() => renderAll());
   const offScheme = bridge.onColorSchemeChange?.((scheme) => {
     root.dataset.mhScheme = scheme === "dark" ? "dark" : "light";
@@ -2718,6 +3472,10 @@ export function mountMcpHub(container, bridge) {
     disposed = true;
     if (toastTimer) clearTimeout(toastTimer);
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    if (livePollTimer) clearInterval(livePollTimer);
+    if (rafId !== null && typeof win?.cancelAnimationFrame === "function") {
+      win.cancelAnimationFrame(rafId);
+    }
     for (const key of [...oauthTimers.keys()]) stopOAuthPolling(key);
     offLocale?.();
     offScheme?.();

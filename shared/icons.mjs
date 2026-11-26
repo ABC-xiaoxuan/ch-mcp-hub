@@ -90,6 +90,16 @@ const SVG_PATHS = {
   bolt: [
     '<path d="M13 2 4.5 13.5H12L11 22l8.5-11.5H12L13 2Z" />',
   ],
+  play: [
+    '<polygon points="6.5 4.5 19.5 12 6.5 19.5 6.5 4.5" />',
+  ],
+  shield: [
+    '<path d="M12 3 5 6v6c0 4.5 3 7.8 7 9 4-1.2 7-4.5 7-9V6l-7-3Z" />',
+  ],
+  file: [
+    '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" />',
+    '<path d="M14 3v5h5" />',
+  ],
 };
 
 export function iconSvg(name, size = 15) {

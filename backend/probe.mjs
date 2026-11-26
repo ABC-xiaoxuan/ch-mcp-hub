@@ -132,6 +132,26 @@ export async function discoverOAuthMetadata(mcpUrl, wwwAuthenticateHeader = "") 
   };
 }
 
+function summarizeInputSchema(schema) {
+  if (!schema || typeof schema !== "object") return null;
+  const props = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+  const required = Array.isArray(schema.required) ? schema.required.map(String) : [];
+  const fields = Object.entries(props)
+    .slice(0, 24)
+    .map(([name, def]) => ({
+      name,
+      type:
+        typeof def?.type === "string"
+          ? def.type
+          : Array.isArray(def?.type)
+            ? def.type.join("|")
+            : "any",
+      required: required.includes(name),
+      description: typeof def?.description === "string" ? def.description.slice(0, 140) : "",
+    }));
+  return { fields, required };
+}
+
 function parseJsonRpcResponse(text, contentType) {
   const ct = (contentType ?? "").toLowerCase();
   if (ct.includes("text/event-stream")) {
@@ -264,7 +284,8 @@ async function probeRemoteServer(server) {
         if (Array.isArray(toolsRpc?.result?.tools)) {
           tools = toolsRpc.result.tools.slice(0, 120).map((t) => ({
             name: String(t.name ?? ""),
-            description: typeof t.description === "string" ? t.description.slice(0, 200) : "",
+            description: typeof t.description === "string" ? t.description.slice(0, 240) : "",
+            inputSchema: summarizeInputSchema(t.inputSchema),
           }));
         }
       }
@@ -412,4 +433,161 @@ export async function probeAllServers(servers, { concurrency = 4, force = true }
   );
   await Promise.all(workers);
   return results;
+}
+
+const MAX_TOOL_OUTPUT_CHARS = 64 * 1024;
+
+/**
+ * Execute a live Streamable HTTP MCP `tools/call` invocation for interactive testing
+ * inside the Tool Playground drawer (pure Node fetch, 15s timeout, 64KB response cap).
+ */
+export async function callMcpTool(server, toolName, toolArgs = {}) {
+  const startedAt = Date.now();
+  const url = String(server?.url ?? "").trim();
+  const name = String(toolName ?? "").trim();
+  if (!url) {
+    return { ok: false, latencyMs: 0, isError: true, errorMessage: "Tool runner requires a remote HTTP/SSE MCP URL", rawText: "", truncated: false };
+  }
+  if (!name) {
+    return { ok: false, latencyMs: 0, isError: true, errorMessage: "Tool name is required", rawText: "", truncated: false };
+  }
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      throw new Error("URL must use http:// or https://");
+    }
+  } catch (err) {
+    return { ok: false, latencyMs: 0, isError: true, errorMessage: err instanceof Error ? err.message : "Invalid URL", rawText: "", truncated: false };
+  }
+
+  const baseHeaders = {
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+    ...(server.headers ?? {}),
+  };
+
+  try {
+    const initRes = await fetch(parsedUrl.href, {
+      method: "POST",
+      headers: baseHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: "codexhost-mcp-hub", version: "1.2.0" },
+        },
+      }),
+      signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+    });
+
+    if (!initRes.ok) {
+      return {
+        ok: false,
+        latencyMs: Date.now() - startedAt,
+        isError: true,
+        errorMessage: `MCP initialize failed (HTTP ${initRes.status})`,
+        rawText: "",
+        truncated: false,
+      };
+    }
+
+    const sessionId = initRes.headers.get("mcp-session-id");
+    await initRes.text().catch(() => "");
+    const sessionHeaders = {
+      ...baseHeaders,
+      ...(sessionId ? { "Mcp-Session-Id": sessionId } : {}),
+    };
+
+    await fetch(parsedUrl.href, {
+      method: "POST",
+      headers: sessionHeaders,
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      signal: AbortSignal.timeout(3_000),
+    }).catch(() => {});
+
+    const callRes = await fetch(parsedUrl.href, {
+      method: "POST",
+      headers: sessionHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name,
+          arguments: toolArgs && typeof toolArgs === "object" && !Array.isArray(toolArgs) ? toolArgs : {},
+        },
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    const latencyMs = Date.now() - startedAt;
+    const bodyText = await callRes.text();
+    if (!callRes.ok) {
+      return {
+        ok: false,
+        latencyMs,
+        isError: true,
+        errorMessage: `HTTP ${callRes.status}: ${bodyText.slice(0, 240)}`,
+        rawText: "",
+        truncated: false,
+      };
+    }
+
+    const rpc = parseJsonRpcResponse(bodyText, callRes.headers.get("content-type"));
+    if (!rpc) {
+      return {
+        ok: false,
+        latencyMs,
+        isError: true,
+        errorMessage: "Server did not return a valid JSON-RPC response",
+        rawText: bodyText.slice(0, 2000),
+        truncated: bodyText.length > 2000,
+      };
+    }
+    if (rpc.error) {
+      return {
+        ok: false,
+        latencyMs,
+        isError: true,
+        errorMessage: rpc.error.message || JSON.stringify(rpc.error),
+        rawText: "",
+        truncated: false,
+      };
+    }
+
+    const result = rpc.result ?? {};
+    const contentItems = Array.isArray(result.content) ? result.content : [];
+    const textParts = [];
+    for (const item of contentItems) {
+      if (item && typeof item === "object") {
+        if (typeof item.text === "string") textParts.push(item.text);
+        else textParts.push(JSON.stringify(item, null, 2));
+      }
+    }
+    const formatted =
+      textParts.length > 0 ? textParts.join("\n\n") : JSON.stringify(result, null, 2);
+    const truncated = formatted.length > MAX_TOOL_OUTPUT_CHARS;
+
+    return {
+      ok: !result.isError,
+      latencyMs,
+      isError: Boolean(result.isError),
+      errorMessage: result.isError ? "Tool returned an error response" : "",
+      rawText: truncated ? formatted.slice(0, MAX_TOOL_OUTPUT_CHARS) : formatted,
+      truncated,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      latencyMs: Date.now() - startedAt,
+      isError: true,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      rawText: "",
+      truncated: false,
+    };
+  }
 }

@@ -10,7 +10,8 @@
  * - Discovers Global MCPs, Claude project-scoped MCPs, and Antigravity/Claude native plugins.
  */
 
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { watch } from "node:fs";
+import { mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { parseCodexMcpToml, patchCodexMcpToml, renderCodexMcpServerBlock } from "./toml.mjs";
@@ -73,7 +74,47 @@ export const HARNESS_META = {
 };
 
 const MAX_BACKUPS = 40;
+const MAX_BACKUP_PREVIEW_BYTES = 64 * 1024;
 const VALID_SERVER_NAME_RE = /^[A-Za-z0-9._:@/-]{1,128}$/u;
+const SECRET_KEY_RE = /(auth|token|secret|api[_-]?key|access[_-]?key|password|passwd|cookie|credential|private[_-]?key)/iu;
+const SECRET_VAL_RE = /^(Bearer\s+\S|Basic\s+\S|ghp_|gho_|github_pat_|sk-|ntn_|xox[baprs]-|eyJ[A-Za-z0-9_-]{10,})/u;
+const ENV_PLACEHOLDER_RE = /^(\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|<[A-Z0-9_]+>|YOUR_[A-Z0-9_]+)$/u;
+
+export function isHardcodedSecret(key, value) {
+  const val = String(value ?? "").trim();
+  if (!val || val.length < 6) return false;
+  if (ENV_PLACEHOLDER_RE.test(val)) return false;
+  const bearerTail = val.replace(/^Bearer\s+/iu, "").trim();
+  if (ENV_PLACEHOLDER_RE.test(bearerTail)) return false;
+  return SECRET_KEY_RE.test(String(key ?? "")) || SECRET_VAL_RE.test(val);
+}
+
+export function redactSecretMap(map) {
+  if (!map || typeof map !== "object") return {};
+  const out = {};
+  for (const [k, v] of Object.entries(map)) {
+    const str = String(v ?? "");
+    if (isHardcodedSecret(k, str)) {
+      out[k] = /^Bearer\s+/iu.test(str) ? "Bearer <REDACTED>" : "<REDACTED>";
+    } else {
+      out[k] = str;
+    }
+  }
+  return out;
+}
+
+export function countHardcodedSecrets(instances) {
+  const seen = new Set();
+  for (const inst of Object.values(instances ?? {})) {
+    for (const [k, v] of Object.entries(inst?.headers ?? {})) {
+      if (isHardcodedSecret(k, v)) seen.add(`h:${k}`);
+    }
+    for (const [k, v] of Object.entries(inst?.env ?? {})) {
+      if (isHardcodedSecret(k, v)) seen.add(`e:${k}`);
+    }
+  }
+  return seen.size;
+}
 
 function shellQuote(arg) {
   return /^[A-Za-z0-9._:/-]+$/u.test(arg) ? arg : JSON.stringify(arg);
@@ -672,6 +713,9 @@ export class McpConfigStore {
   #backupIndexCache = null;
   #backupVersion = 0;
   #overviewMemo = null; // { sig, payload }
+  #revision = 1;
+  #watchers = [];
+  #watchTimer = null;
 
   constructor({ dataDir, homeDir = os.homedir(), getOverrides = async () => ({}) }) {
     this.dataDir = dataDir;
@@ -680,6 +724,96 @@ export class McpConfigStore {
     this.backupsDir = path.join(dataDir, "backups");
     this.backupIndexPath = path.join(this.backupsDir, "index.json");
     this.stashPath = path.join(dataDir, "claude-disabled-stash.json");
+  }
+
+  getRevision() {
+    return this.#revision;
+  }
+
+  #bumpRevision() {
+    this.#revision += 1;
+    this.#overviewMemo = null;
+  }
+
+  /**
+   * Lightweight non-blocking fs.watch on parent directories of the 4 harness configs
+   * + native plugin configs. Only bumps `#revision` when a watched filename changes
+   * so `overview.poll` stays 0-I/O (~0.03 ms) during idle periods and reacts instantly to CLI edits.
+   */
+  async startWatching() {
+    this.stopWatching();
+    const paths = await this.#resolvePaths().catch(() => null);
+    if (!paths) return;
+
+    const watchedFiles = [
+      paths["claude-code"],
+      paths.antigravity,
+      paths.opencode,
+      paths.codex,
+      path.join(this.homeDir, ".gemini", "config", "config.json"),
+      path.join(this.homeDir, ".claude", "settings.json"),
+    ];
+
+    const byDir = new Map();
+    for (const full of watchedFiles) {
+      if (!full) continue;
+      const rawDir = path.dirname(full);
+      // Canonicalize 8.3 short paths & symlinks before fs.watch (prevents Windows libuv fs-event assertion).
+      const canonicalDir = await realpath(rawDir).catch(() => null);
+      if (!canonicalDir) continue;
+      const base = path.basename(full).toLowerCase();
+      if (!byDir.has(canonicalDir)) byDir.set(canonicalDir, new Set());
+      byDir.get(canonicalDir).add(base);
+    }
+
+    const scheduleBump = () => {
+      if (this.#watchTimer) return;
+      this.#watchTimer = setTimeout(() => {
+        this.#watchTimer = null;
+        this.#bumpRevision();
+      }, 180);
+      this.#watchTimer.unref?.();
+    };
+
+    for (const [dir, names] of byDir.entries()) {
+      try {
+        const watcher = watch(dir, { persistent: false }, (_eventType, filename) => {
+          if (!filename) {
+            scheduleBump();
+            return;
+          }
+          const lower = String(filename).toLowerCase();
+          if (names.has(lower)) {
+            scheduleBump();
+          }
+        });
+        watcher.on("error", () => {
+          // Ignore transient watcher errors on removed or virtual folders.
+        });
+        this.#watchers.push(watcher);
+      } catch {
+        // Directory does not exist yet — safe to skip; stat-based reads still catch creation.
+      }
+    }
+  }
+
+  stopWatching() {
+    if (this.#watchTimer) {
+      clearTimeout(this.#watchTimer);
+      this.#watchTimer = null;
+    }
+    for (const w of this.#watchers) {
+      try {
+        w.close();
+      } catch {
+        // Ignore close errors.
+      }
+    }
+    this.#watchers = [];
+  }
+
+  dispose() {
+    this.stopWatching();
   }
 
   #enqueue(key, task) {
@@ -779,7 +913,7 @@ export class McpConfigStore {
       const removed = index.splice(MAX_BACKUPS);
       this.#backupIndexCache = index;
       this.#backupVersion += 1;
-      this.#overviewMemo = null;
+      this.#bumpRevision();
       await atomicWriteUtf8(this.backupIndexPath, JSON.stringify(index, null, 2) + "\n");
       for (const old of removed) {
         await unlink(path.join(this.backupsDir, `${old.id}.dat`)).catch(() => {});
@@ -791,6 +925,23 @@ export class McpConfigStore {
   async listBackups() {
     const index = await this.#loadBackupIndex();
     return [...index];
+  }
+
+  async previewBackup(backupId) {
+    if (!/^[A-Za-z0-9_.-]+$/u.test(String(backupId ?? ""))) {
+      throw new Error("Invalid backup ID");
+    }
+    const index = await this.#loadBackupIndex();
+    const meta = index.find((item) => item.id === backupId);
+    if (!meta) throw new Error(`Backup snapshot "${backupId}" not found`);
+
+    const content = await readFile(path.join(this.backupsDir, `${backupId}.dat`), "utf8");
+    const truncated = content.length > MAX_BACKUP_PREVIEW_BYTES;
+    return {
+      ...meta,
+      content: truncated ? content.slice(0, MAX_BACKUP_PREVIEW_BYTES) : content,
+      truncated,
+    };
   }
 
   async restoreBackup(backupId) {
@@ -810,6 +961,7 @@ export class McpConfigStore {
       }
       await atomicWriteUtf8(targetPath, content);
       this.#fileCache.invalidate(targetPath);
+      this.#bumpRevision();
       return { restored: true, harnessId: meta.harnessId, configPath: targetPath };
     });
   }
@@ -1090,6 +1242,7 @@ export class McpConfigStore {
         doc.plugins[id] = { ...(doc.plugins[id] ?? {}), enabled: Boolean(enabled) };
         await atomicWriteUtf8(cfgPath, JSON.stringify(doc, null, 2) + "\n");
         this.#fileCache.invalidate(cfgPath);
+        this.#bumpRevision();
         return { harnessId, pluginId: id, enabled: Boolean(enabled) };
       });
     }
@@ -1106,6 +1259,7 @@ export class McpConfigStore {
         doc.enabledPlugins[id] = Boolean(enabled);
         await atomicWriteUtf8(cfgPath, JSON.stringify(doc, null, 2) + "\n");
         this.#fileCache.invalidate(cfgPath);
+        this.#bumpRevision();
         return { harnessId, pluginId: id, enabled: Boolean(enabled) };
       });
     }
@@ -1176,6 +1330,7 @@ export class McpConfigStore {
           }
 
           this.#fileCache.invalidate(configPath);
+          this.#bumpRevision();
           return { harnessId, configPath, ok: true };
         }),
       ),
@@ -1242,7 +1397,10 @@ export class McpConfigStore {
             }
           }
 
-          if (changed) this.#fileCache.invalidate(configPath);
+          if (changed) {
+            this.#fileCache.invalidate(configPath);
+            this.#bumpRevision();
+          }
           return { harnessId, removed: changed };
         }),
       ),
@@ -1301,24 +1459,78 @@ export class McpConfigStore {
     return { sourceHarnessId, targets, synced };
   }
 
+  async batchToggle(serverNames, enabled) {
+    const names = Array.isArray(serverNames) ? serverNames.map((n) => validateServerName(n)) : [];
+    const overview = await this.buildOverview({ includeBackups: false });
+    const updated = [];
+    for (const name of names) {
+      const match = overview.servers.find((s) => s.name === name);
+      if (!match) continue;
+      for (const [hid, inst] of Object.entries(match.instances)) {
+        if (Boolean(inst.enabled) !== Boolean(enabled)) {
+          await this.upsertServer({ ...inst, enabled: Boolean(enabled) }, [hid]);
+        }
+      }
+      updated.push(name);
+    }
+    this.#bumpRevision();
+    return { updated, enabled: Boolean(enabled) };
+  }
+
+  async batchSync(serverNames, targetHarnessIds) {
+    const names = Array.isArray(serverNames) ? serverNames.map((n) => validateServerName(n)) : [];
+    const targets = (Array.isArray(targetHarnessIds) ? targetHarnessIds : HARNESS_IDS).filter((id) =>
+      HARNESS_IDS.includes(id),
+    );
+    if (targets.length === 0) throw new Error("Select at least one target harness");
+    const overview = await this.buildOverview({ includeBackups: false });
+    const synced = [];
+    for (const name of names) {
+      const match = overview.servers.find((s) => s.name === name);
+      if (!match) continue;
+      const source = match.instances[match.primaryHarnessId];
+      if (!source) continue;
+      await this.upsertServer(source, targets);
+      synced.push(name);
+    }
+    this.#bumpRevision();
+    return { synced, targets };
+  }
+
+  async batchDelete(serverNames, targetHarnessIds) {
+    const names = Array.isArray(serverNames) ? serverNames.map((n) => validateServerName(n)) : [];
+    const targets = (Array.isArray(targetHarnessIds) ? targetHarnessIds : HARNESS_IDS).filter((id) =>
+      HARNESS_IDS.includes(id),
+    );
+    const deleted = [];
+    for (const name of names) {
+      await this.deleteServer(name, targets);
+      deleted.push(name);
+    }
+    this.#bumpRevision();
+    return { deleted, targets };
+  }
+
   async buildOverview({ includeBackups = true } = {}) {
     const t0 = performance.now();
     // Single-pass path resolution avoids 4x redundant opencode candidate stat probes.
     const paths = await this.#resolvePaths();
-    const [snapshots, nativePlugins, backups] = await Promise.all([
+    const [snapshots, nativePlugins, backupIndex] = await Promise.all([
       Promise.all(HARNESS_IDS.map((id) => this.readHarness(id, paths))),
       this.readNativePlugins(),
-      includeBackups ? this.listBackups() : Promise.resolve(null),
+      this.#loadBackupIndex(),
     ]);
 
     const cacheHits = snapshots.filter((s) => s.cacheHit).length;
+    const backupCount = backupIndex.length;
     const memoSig = `${snapshots.map((s) => s.sig).join("|")}::${nativePlugins.sig}::${
-      includeBackups ? `b${this.#backupVersion}:${backups?.length ?? 0}` : "nobkp"
+      includeBackups ? `full:${this.#backupVersion}:${backupCount}` : `cnt:${this.#backupVersion}:${backupCount}`
     }`;
 
     if (this.#overviewMemo && this.#overviewMemo.sig === memoSig) {
       return {
         ...this.#overviewMemo.payload,
+        revision: this.#revision,
         perf: {
           readMs: Math.round((performance.now() - t0) * 100) / 100,
           cacheHits,
@@ -1367,6 +1579,7 @@ export class McpConfigStore {
     const servers = [...byName.values()]
       .map((group) => {
         const drift = computeServerDrift(group.instances);
+        const secretCount = countHardcodedSecrets(group.instances);
         const cliHints = {};
         for (const hid of HARNESS_IDS) {
           cliHints[hid] = {
@@ -1388,6 +1601,7 @@ export class McpConfigStore {
           primaryHarnessId: group.primaryHarnessId,
           hasDrift: drift.hasDrift,
           driftFields: drift.fields,
+          secretCount,
           harnessCount: Object.keys(group.instances).length,
           instances: group.instances,
           cliHints,
@@ -1400,12 +1614,14 @@ export class McpConfigStore {
       servers,
       scopedServers: scopedEntries,
       nativePlugins: nativePlugins.plugins,
-      ...(backups !== null ? { backups } : {}),
+      backupCount,
+      ...(includeBackups ? { backups: [...backupIndex] } : {}),
     };
     this.#overviewMemo = { sig: memoSig, payload };
 
     return {
       ...payload,
+      revision: this.#revision,
       perf: {
         readMs: Math.round((performance.now() - t0) * 100) / 100,
         cacheHits,
@@ -1414,23 +1630,25 @@ export class McpConfigStore {
     };
   }
 
-  async exportStandardJson(harnessId = null) {
+  async exportStandardJson(harnessId = null, { redactSecrets = true } = {}) {
     const overview = await this.buildOverview({ includeBackups: false });
     const mcpServers = {};
     for (const item of overview.servers) {
       const source = harnessId ? item.instances[harnessId] : item.instances[item.primaryHarnessId];
       if (!source) continue;
       if (source.transport === "http" || source.transport === "sse") {
+        const headers = redactSecrets ? redactSecretMap(source.headers) : source.headers ?? {};
         mcpServers[item.name] = {
           type: source.transport,
           url: source.url,
-          ...(Object.keys(source.headers ?? {}).length > 0 ? { headers: source.headers } : {}),
+          ...(Object.keys(headers).length > 0 ? { headers } : {}),
         };
       } else {
+        const env = redactSecrets ? redactSecretMap(source.env) : source.env ?? {};
         mcpServers[item.name] = {
           command: source.command,
           ...(source.args?.length ? { args: source.args } : {}),
-          ...(Object.keys(source.env ?? {}).length > 0 ? { env: source.env } : {}),
+          ...(Object.keys(env).length > 0 ? { env } : {}),
         };
       }
     }

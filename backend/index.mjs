@@ -1,15 +1,25 @@
 /**
- * CodexHost Unified Extension Backend (`mcp-hub`).
+ * CodexHost Unified Extension Backend (`mcp-hub` v1.2.0).
  *
  * Runs as a single Host-managed Node.js process shared by Codex Desktop and CH Web.
- * Pure Node.js standard library implementation with stat-cached config reads,
- * separated backup index, bounded-concurrency live probing, and zero subprocess spawning.
+ * Pure Node.js standard library implementation with:
+ * - Projected stat-cached config reads + overview memoization
+ * - Lightweight fs.watch + revision-based 0-I/O `overview.poll`
+ * - Slim mutation responses (lazy backups + one-time presets delivery)
+ * - Live Streamable HTTP tool schema discovery & interactive `tools/call` runner
+ * - Secret-redacted safe JSON export & batch operations
  */
 
 import { HARNESS_IDS, McpConfigStore, renderNativePreviews } from "./adapters.mjs";
 import { McpOAuthManager } from "./oauth.mjs";
 import { MCP_PRESETS, parseImportedMcpJson } from "./presets.mjs";
-import { clearProbeCache, getCachedProbes, probeAllServers, probeMcpServer } from "./probe.mjs";
+import {
+  callMcpTool,
+  clearProbeCache,
+  getCachedProbes,
+  probeAllServers,
+  probeMcpServer,
+} from "./probe.mjs";
 
 export async function activate(ctx) {
   const oauth = new McpOAuthManager();
@@ -17,20 +27,38 @@ export async function activate(ctx) {
     dataDir: ctx.dataDir,
     getOverrides: () => ctx.readSettings(),
   });
+  await store.startWatching();
 
-  const buildPayload = async ({ includeBackups = true } = {}) => {
+  const buildPayload = async ({ includeBackups = false, includePresets = false } = {}) => {
     const overview = await store.buildOverview({ includeBackups });
     return {
       ...overview,
       cachedProbes: getCachedProbes(overview.servers),
-      presets: MCP_PRESETS,
+      ...(includePresets ? { presets: MCP_PRESETS } : {}),
       harnessOrder: HARNESS_IDS,
       pid: process.pid,
     };
   };
 
   ctx.handle("overview.get", async (params) => {
-    return buildPayload({ includeBackups: params?.includeBackups !== false });
+    return buildPayload({
+      includeBackups: params?.includeBackups === true,
+      includePresets: params?.includePresets !== false,
+    });
+  });
+
+  // Zero-I/O incremental revision poll (~28 bytes when unchanged).
+  ctx.handle("overview.poll", async (params) => {
+    const since = Number(params?.sinceRevision ?? 0);
+    const current = store.getRevision();
+    if (since > 0 && since === current) {
+      return { changed: false, revision: current };
+    }
+    return {
+      changed: true,
+      revision: current,
+      overview: await buildPayload({ includeBackups: false, includePresets: false }),
+    };
   });
 
   ctx.handle("server.previewNative", async (params) => {
@@ -80,6 +108,30 @@ export async function activate(ctx) {
     return { synced, overview: await buildPayload() };
   });
 
+  ctx.handle("server.batchToggle", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid batch toggle payload");
+    }
+    const res = await store.batchToggle(params.names, params.enabled);
+    return { ...res, overview: await buildPayload() };
+  });
+
+  ctx.handle("server.batchSync", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid batch sync payload");
+    }
+    const res = await store.batchSync(params.names, params.targets);
+    return { ...res, overview: await buildPayload() };
+  });
+
+  ctx.handle("server.batchDelete", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid batch delete payload");
+    }
+    const res = await store.batchDelete(params.names, params.targets);
+    return { ...res, overview: await buildPayload() };
+  });
+
   ctx.handle("server.probe", async (params) => {
     if (!params || typeof params !== "object") {
       throw new Error("Invalid probe payload");
@@ -109,6 +161,21 @@ export async function activate(ctx) {
       force: params?.force !== false,
     });
     return { results };
+  });
+
+  ctx.handle("server.callTool", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid callTool payload");
+    }
+    const overview = await store.buildOverview({ includeBackups: false });
+    const match = overview.servers.find((s) => s.name === params.name);
+    if (!match) {
+      throw new Error(`Server "${params.name}" not found`);
+    }
+    const instance =
+      (params.harnessId && match.instances[params.harnessId]) ||
+      match.instances[match.primaryHarnessId];
+    return callMcpTool(instance, params.toolName, params.arguments ?? {});
   });
 
   ctx.handle("plugin.toggle", async (params) => {
@@ -192,20 +259,26 @@ export async function activate(ctx) {
   ctx.handle("config.exportJson", async (params) => {
     const harnessId =
       typeof params?.harnessId === "string" && params.harnessId ? params.harnessId : null;
-    const json = await store.exportStandardJson(harnessId);
-    return { json };
+    const redactSecrets = params?.redactSecrets !== false;
+    const json = await store.exportStandardJson(harnessId, { redactSecrets });
+    return { json, redactSecrets };
   });
 
   ctx.handle("backups.list", async () => {
     return { backups: await store.listBackups() };
   });
 
+  ctx.handle("backups.preview", async (params) => {
+    return store.previewBackup(params?.backupId);
+  });
+
   ctx.handle("backups.restore", async (params) => {
     const restored = await store.restoreBackup(params?.backupId);
-    return { restored, overview: await buildPayload() };
+    return { restored, overview: await buildPayload({ includeBackups: true }) };
   });
 
   return () => {
+    store.dispose();
     oauth.dispose();
     clearProbeCache();
   };

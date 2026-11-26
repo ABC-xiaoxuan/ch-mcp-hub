@@ -8,11 +8,14 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import {
   McpConfigStore,
   computeServerDrift,
+  countHardcodedSecrets,
+  isHardcodedSecret,
   renderNativePreviews,
 } from "../backend/adapters.mjs";
 import { activate } from "../backend/index.mjs";
 import { parseImportedMcpJson } from "../backend/presets.mjs";
 import {
+  callMcpTool,
   clearProbeCache,
   getCachedProbes,
   probeAllServers,
@@ -335,6 +338,69 @@ describe("Four-harness McpConfigStore & Performance Engine", () => {
     assert.equal(notion.instances.opencode.url, "https://mcp.notion.com/mcp");
     assert.equal(notion.instances.codex.url, "https://mcp.notion.com/mcp");
   });
+
+  it("detects hardcoded secrets, redacts exports by default, previews backups, and executes batch ops", async () => {
+    assert.equal(isHardcodedSecret("Authorization", "Bearer sk-1234567890"), true);
+    assert.equal(isHardcodedSecret("Authorization", "Bearer ${NOTION_TOKEN}"), false);
+    assert.equal(isHardcodedSecret("GITHUB_TOKEN", "ghp_abcdef123456789"), true);
+    assert.equal(isHardcodedSecret("PW_HEADLESS", "1"), false);
+
+    await store.upsertServer(
+      {
+        name: "github",
+        transport: "http",
+        url: "https://api.githubcopilot.com/mcp/",
+        headers: { Authorization: "Bearer ghp_supersecret123456" },
+        enabled: true,
+      },
+      ["claude-code"],
+    );
+    await store.upsertServer(
+      {
+        name: "context7",
+        transport: "http",
+        url: "https://mcp.context7.com/mcp",
+        enabled: true,
+      },
+      ["claude-code"],
+    );
+
+    const ov = await store.buildOverview({ includeBackups: false });
+    assert.equal(ov.backups, undefined);
+    assert.equal(typeof ov.backupCount, "number");
+    const gh = ov.servers.find((s) => s.name === "github");
+    assert.equal(gh.secretCount, 1);
+    assert.equal(countHardcodedSecrets(gh.instances), 1);
+
+    // Safe redacted export by default
+    const redacted = await store.exportStandardJson(null, { redactSecrets: true });
+    assert.match(redacted, /Bearer <REDACTED>/);
+    assert.doesNotMatch(redacted, /ghp_supersecret123456/);
+
+    // Explicit unredacted export preserves raw token
+    const rawExport = await store.exportStandardJson(null, { redactSecrets: false });
+    assert.match(rawExport, /ghp_supersecret123456/);
+
+    // Batch sync -> batch disable -> backup preview -> batch delete
+    await store.batchSync(["github", "context7"], ["antigravity", "codex"]);
+    const afterSync = await store.buildOverview({ includeBackups: false });
+    assert.equal(afterSync.servers.find((s) => s.name === "github").harnessCount, 3);
+
+    await store.batchToggle(["github", "context7"], false);
+    const afterDisable = await store.buildOverview({ includeBackups: false });
+    assert.equal(afterDisable.servers.find((s) => s.name === "context7").instances.codex.enabled, false);
+
+    const backups = await store.listBackups();
+    assert.ok(backups.length >= 1);
+    const preview = await store.previewBackup(backups[0].id);
+    assert.equal(preview.id, backups[0].id);
+    assert.equal(typeof preview.content, "string");
+    assert.ok(preview.content.length > 0);
+
+    await store.batchDelete(["github", "context7"], ["claude-code", "antigravity", "opencode", "codex"]);
+    const afterDel = await store.buildOverview({ includeBackups: false });
+    assert.equal(afterDel.servers.length, 0);
+  });
 });
 
 describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch probe", () => {
@@ -433,7 +499,32 @@ describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch pr
               JSON.stringify({
                 jsonrpc: "2.0",
                 id: msg.id,
-                result: { tools: [{ name: "search_docs", description: "Search documents" }] },
+                result: {
+                  tools: [
+                    {
+                      name: "search_docs",
+                      description: "Search documents",
+                      inputSchema: {
+                        type: "object",
+                        properties: { query: { type: "string", description: "Search term" } },
+                        required: ["query"],
+                      },
+                    },
+                  ],
+                },
+              }),
+            );
+            return;
+          }
+          if (msg.method === "tools/call") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: msg.id,
+                result: {
+                  content: [{ type: "text", text: `Matched: ${msg.params?.arguments?.query ?? ""}` }],
+                },
               }),
             );
             return;
@@ -454,6 +545,13 @@ describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch pr
       assert.equal(okRes.cached, false);
       assert.equal(okRes.serverInfo.name, "mock-mcp");
       assert.equal(okRes.toolCount, 1);
+      assert.equal(okRes.tools[0].inputSchema.fields[0].name, "query");
+      assert.equal(okRes.tools[0].inputSchema.fields[0].required, true);
+
+      // Live tools/call runner
+      const toolOut = await callMcpTool({ transport: "http", url }, "search_docs", { query: "mcp" });
+      assert.equal(toolOut.ok, true);
+      assert.equal(toolOut.rawText, "Matched: mcp");
 
       // Non-forced call hits 60s TTL cache immediately
       const cachedRes = await probeMcpServer({ name: "demo", transport: "http", url }, { force: false });
@@ -505,12 +603,18 @@ describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch pr
     try {
       for (const rpc of [
         "overview.get",
+        "overview.poll",
         "server.previewNative",
         "server.upsert",
         "server.sync",
+        "server.batchToggle",
+        "server.batchSync",
+        "server.batchDelete",
         "server.probe",
         "server.probeAll",
+        "server.callTool",
         "plugin.toggle",
+        "backups.preview",
         "oauth.start",
       ]) {
         assert.ok(handlers.has(rpc), `Missing RPC handler: ${rpc}`);
@@ -519,7 +623,28 @@ describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch pr
       const overview = await handlers.get("overview.get")();
       assert.equal(overview.harnesses.length, 4);
       assert.equal(overview.servers.length, 0);
+      assert.ok(Array.isArray(overview.presets) && overview.presets.length > 0);
+      assert.equal(overview.backups, undefined);
+      assert.equal(overview.backupCount, 0);
       assert.ok(overview.perf && typeof overview.perf.readMs === "number");
+
+      // Zero-I/O incremental poll returns changed:false when revision matches
+      const pollIdle = await handlers.get("overview.poll")({ sinceRevision: overview.revision });
+      assert.equal(pollIdle.changed, false);
+      assert.equal(pollIdle.revision, overview.revision);
+
+      // Mutation returns slim payload (no presets, no full backups array) & advances revision
+      const up = await handlers.get("server.upsert")({
+        server: { name: "demo", transport: "http", url: "https://mcp.example.com/mcp" },
+        targets: ["claude-code"],
+      });
+      assert.equal(up.overview.presets, undefined);
+      assert.equal(up.overview.backups, undefined);
+      assert.ok(up.overview.revision > overview.revision);
+
+      const pollChanged = await handlers.get("overview.poll")({ sinceRevision: overview.revision });
+      assert.equal(pollChanged.changed, true);
+      assert.equal(pollChanged.overview.servers.length, 1);
     } finally {
       await dispose();
       await rm(tmp, { recursive: true, force: true });
