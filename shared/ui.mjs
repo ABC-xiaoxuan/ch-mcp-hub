@@ -28,6 +28,8 @@ const DOCK_LABELS = {
 const TOOLS_INITIAL_LIMIT = 12;
 const SEARCH_DEBOUNCE_MS = 60;
 const REGISTRY_DEBOUNCE_MS = 420;
+const DRAWER_SEARCH_DEBOUNCE_MS = 260;
+const DRAWER_QUICK_TERMS = ["Stripe", "Notion", "Postgres", "DeepWiki", "Playwright", "Supabase", "Cloudflare", "Tavily"];
 const VISIBILITY_REFRESH_MIN_INTERVAL_MS = 2500;
 const LIVE_POLL_INTERVAL_MS = 4000;
 
@@ -359,6 +361,9 @@ export function mountMcpHub(container, bridge) {
   let searchDebounceTimer = null;
   let registryDebounceTimer = null;
   let registryReqSeq = 0;
+  let drawerSearchDebounceTimer = null;
+  let drawerSearchReqSeq = 0;
+  let isComposingDrawerSearch = false;
   let livePollTimer = null;
   let isComposingSearch = false;
   let lastRefreshAt = 0;
@@ -980,7 +985,15 @@ export function mountMcpHub(container, bridge) {
       isEdit: Boolean(editServer),
       editServer,
       sourceHarnessId,
-      activeTab: "form", // form | preview
+      activeTab: !editServer && !prefill ? "search" : "form", // search | form | preview
+      searchQuery: "",
+      searchLoading: false,
+      searchOffline: false,
+      searchSearched: false,
+      searchSmartMatch: null,
+      searchRegistryItems: [],
+      pickedFrom: null,
+      _resolvedSearchItems: [],
       name: base.name ?? "",
       transport: base.transport ?? "http",
       url: "",
@@ -1003,6 +1016,254 @@ export function mountMcpHub(container, bridge) {
     };
     loadDrawerInstanceValues(drawerState, base);
     state.drawer = drawerState;
+    renderDrawer();
+    if (drawerState.activeTab === "search") {
+      const focusSearch = () => {
+        if (!disposed && state.drawer === drawerState) {
+          slots.drawer.querySelector("[data-drawer-search-input]")?.focus();
+        }
+      };
+      if (typeof win?.requestAnimationFrame === "function") win.requestAnimationFrame(focusSearch);
+      else focusSearch();
+    }
+  };
+
+  const catalogDedupeKey = (item) => {
+    if (!item) return "";
+    if (item.url) return `url:${String(item.url).trim().replace(/\/+$/u, "").toLowerCase()}`;
+    const cmd = String(item.command ?? "").trim().toLowerCase();
+    const args = Array.isArray(item.args)
+      ? item.args.map((a) => String(a).trim().toLowerCase()).join(" ")
+      : "";
+    return `cmd:${cmd}:${args}`;
+  };
+
+  const scoreLocalPreset = (preset, q) => {
+    if (!q) return 100;
+    const id = String(preset.id ?? "").toLowerCase();
+    const name = String(preset.name ?? "").toLowerCase();
+    const hay = String(preset._hay ?? `${id} ${name}`).toLowerCase();
+    if (id === q || name === q) return 10_000;
+    if (id.startsWith(q) || name.startsWith(q)) return 8_000;
+    if (id.includes(q) || name.includes(q)) return 6_500;
+    if (hay.includes(q)) return 2_000;
+    return 0;
+  };
+
+  const computeDrawerSearchResults = (d) => {
+    const q = String(d.searchQuery ?? "").trim().toLowerCase();
+    const presets = state.overview?.presets ?? [];
+    const seen = new Set();
+    const featuredMatches = [];
+
+    for (const preset of presets) {
+      const sc = scoreLocalPreset(preset, q);
+      if (sc <= 0) continue;
+      featuredMatches.push({
+        item: { ...preset, source: "featured" },
+        score: sc,
+      });
+    }
+    featuredMatches.sort((a, b) => b.score - a.score);
+
+    const merged = [];
+    for (const { item } of featuredMatches) {
+      const k = catalogDedupeKey(item) || `id:${item.id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      merged.push(item);
+    }
+
+    if (q) {
+      for (const item of d.searchRegistryItems ?? []) {
+        const k = catalogDedupeKey(item) || `reg:${item.registryName ?? item.id}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        merged.push(item);
+      }
+    }
+
+    d._resolvedSearchItems = merged;
+    return merged;
+  };
+
+  const renderDrawerSearchResultsHtml = (d) => {
+    const lang = resolveLocale(bridge.getLocale());
+    const configured = new Set((state.overview?.servers ?? []).map((s) => s.name));
+    const q = String(d.searchQuery ?? "").trim();
+    const items = computeDrawerSearchResults(d);
+    const smart = q ? d.searchSmartMatch : null;
+
+    const renderRow = (item, idxAttr, isSmart = false) => {
+      const isRemote = item.transport === "http" || item.transport === "sse";
+      const targetPreview = isRemote
+        ? item.url
+        : [item.command, ...(item.args ?? [])].join(" ");
+      const hostShort = compactHostSummary(item);
+      const desc = item.description?.[lang] ?? item.description?.en ?? targetPreview;
+      const visual = getMonogramVisual(item.id);
+      const isInstalled = configured.has(item.id);
+      const sourceBadge = isSmart
+        ? `<span class="mh-badge mh-badge--http">${escapeHtml(t("smartMatchBadge"))}</span>`
+        : item.source === "featured"
+          ? `<span class="mh-badge">${escapeHtml(t("drawerSearchFeaturedBadge"))}</span>`
+          : `<span class="mh-badge mh-badge--http">${escapeHtml(t("registryBadge"))}</span>`;
+
+      return `
+        <div class="mh-drawer-pick-row${isSmart ? " is-smart" : ""}">
+          <div class="mh-drawer-pick-main">
+            <div class="mh-squircle mh-squircle--sm mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
+            <div class="mh-drawer-pick-info">
+              <div class="mh-drawer-pick-head">
+                <span class="mh-drawer-pick-name">${escapeHtml(item.name)}</span>
+                ${sourceBadge}
+                ${item.oauthHint ? `<span class="mh-badge mh-badge--warn">${escapeHtml(t("oauthBadge"))}</span>` : ""}
+                ${isInstalled ? `<span class="mh-badge mh-badge--ok">${escapeHtml(t("installedBadge"))}</span>` : ""}
+              </div>
+              <div class="mh-drawer-pick-sub" title="${escapeHtml(targetPreview)}">${escapeHtml(hostShort)}${item.publisher ? ` · ${escapeHtml(item.publisher)}` : ""}</div>
+              ${desc ? `<p class="mh-drawer-pick-desc">${escapeHtml(desc)}</p>` : ""}
+            </div>
+          </div>
+          <button type="button" class="mh-btn mh-btn--sm${isSmart || !isInstalled ? " mh-btn--primary" : ""}" data-action="drawer-pick-item" data-pick-idx="${escapeHtml(idxAttr)}">
+            ${iconSvg("plus", 12)}<span>${escapeHtml(t("drawerSearchPick"))}</span>
+          </button>
+        </div>
+      `;
+    };
+
+    const totalCount = items.length + (smart ? 1 : 0);
+    const statusText = d.searchLoading
+      ? `<span class="mh-probe-status mh-spin" style="font-size:12px;font-weight:500">${iconSvg("cloud", 13)}<span>${escapeHtml(t("drawerSearchSearching"))}</span></span>`
+      : d.searchOffline
+        ? `<span>${escapeHtml(t("registryOfflineHint"))}</span>`
+        : `<span>${escapeHtml(t("drawerSearchCount", { count: totalCount }))}</span>`;
+
+    const quickChipsHtml = !q
+      ? `
+        <div class="mh-field" style="gap:6px">
+          <span class="mh-hint">${escapeHtml(t("drawerSearchPopular"))}</span>
+          <div class="mh-drawer-quick-row">
+            ${DRAWER_QUICK_TERMS.map(
+              (term) =>
+                `<button type="button" class="mh-drawer-quick-chip" data-action="drawer-quick-search" data-term="${escapeHtml(term)}">${escapeHtml(term)}</button>`,
+            ).join("")}
+          </div>
+        </div>
+      `
+      : "";
+
+    const listHtml =
+      totalCount === 0 && !d.searchLoading
+        ? `
+          <div class="mh-empty" style="padding:28px 16px">
+            ${iconSvg("search", 22)}
+            <p>${escapeHtml(t("drawerSearchNoMatch"))}</p>
+            <button type="button" class="mh-btn mh-btn--sm" data-action="drawer-tab" data-tab="form">
+              ${iconSvg("edit", 13)}<span>${escapeHtml(t("drawerSwitchManual"))}</span>
+            </button>
+          </div>
+        `
+        : `
+          <div class="mh-drawer-pick-list">
+            ${smart ? renderRow(smart, "smart", true) : ""}
+            ${items.map((item, idx) => renderRow(item, String(idx), false)).join("")}
+          </div>
+        `;
+
+    return `
+      ${quickChipsHtml}
+      <div class="mh-drawer-search-meta">${statusText}</div>
+      ${listHtml}
+    `;
+  };
+
+  const patchDrawerSearchResults = () => {
+    const d = state.drawer;
+    if (!d || d.mode !== "editor" || d.activeTab !== "search") return;
+    const slot = slots.drawer.querySelector("[data-drawer-search-results]");
+    if (slot) {
+      slot.innerHTML = renderDrawerSearchResultsHtml(d);
+    } else {
+      renderDrawer();
+    }
+  };
+
+  const runDrawerSearch = async (rawQuery) => {
+    const d = state.drawer;
+    if (!d || d.mode !== "editor") return;
+    const q = String(rawQuery ?? "").trim();
+    if (!q) {
+      d.searchLoading = false;
+      d.searchOffline = false;
+      d.searchSearched = false;
+      d.searchSmartMatch = null;
+      d.searchRegistryItems = [];
+      patchDrawerSearchResults();
+      return;
+    }
+    const seq = ++drawerSearchReqSeq;
+    d.searchLoading = true;
+    d.searchOffline = false;
+    patchDrawerSearchResults();
+    try {
+      const res = await invoke("registry.search", { query: q, limit: 24 });
+      if (disposed || signal.aborted || seq !== drawerSearchReqSeq || state.drawer !== d) return;
+      d.searchLoading = false;
+      d.searchOffline = Boolean(res?.offline);
+      d.searchSearched = true;
+      d.searchSmartMatch = res?.smartMatch ?? null;
+      d.searchRegistryItems = Array.isArray(res?.items) ? res.items : [];
+      patchDrawerSearchResults();
+    } catch {
+      if (disposed || signal.aborted || seq !== drawerSearchReqSeq || state.drawer !== d) return;
+      d.searchLoading = false;
+      d.searchOffline = true;
+      d.searchSearched = true;
+      patchDrawerSearchResults();
+    }
+  };
+
+  const scheduleDrawerSearch = () => {
+    if (drawerSearchDebounceTimer) {
+      clearTimeout(drawerSearchDebounceTimer);
+      drawerSearchDebounceTimer = null;
+    }
+    const d = state.drawer;
+    if (!d || d.mode !== "editor" || d.activeTab !== "search") return;
+    const q = String(d.searchQuery ?? "").trim();
+    patchDrawerSearchResults();
+    if (!q) {
+      d.searchLoading = false;
+      d.searchSmartMatch = null;
+      d.searchRegistryItems = [];
+      patchDrawerSearchResults();
+      return;
+    }
+    const looksDirect = /^https?:\/\//iu.test(q) || q.startsWith("@") || q.includes("/");
+    if (!looksDirect && q.length < 2) return;
+    drawerSearchDebounceTimer = setTimeout(() => {
+      drawerSearchDebounceTimer = null;
+      if (!disposed && state.drawer === d && d.activeTab === "search") {
+        runDrawerSearch(d.searchQuery);
+      }
+    }, DRAWER_SEARCH_DEBOUNCE_MS);
+  };
+
+  const applyDrawerPickedItem = (item) => {
+    const d = state.drawer;
+    if (!d || d.mode !== "editor" || !item) return;
+    d.name = item.id ?? "";
+    loadDrawerInstanceValues(d, {
+      transport: item.transport ?? "http",
+      url: item.url ?? "",
+      command: item.command ?? "npx",
+      args: item.args ?? [],
+      headers: item.headers ?? {},
+      env: item.env ?? {},
+      enabled: true,
+    });
+    d.pickedFrom = item.name || item.id;
+    d.activeTab = "form";
     renderDrawer();
   };
 
@@ -2435,7 +2696,24 @@ export function mountMcpHub(container, bridge) {
     const configuredSources = d.editServer ? Object.keys(d.editServer.instances) : [];
 
     let bodyHtml = "";
-    if (d.activeTab === "preview") {
+    if (d.activeTab === "search" && !d.isEdit) {
+      bodyHtml = `
+        <div class="mh-drawer-search-wrap">
+          <span class="mh-search-icon">${iconSvg("search", 15)}</span>
+          <input
+            class="mh-input"
+            type="search"
+            data-drawer-search-input
+            value="${escapeHtml(d.searchQuery ?? "")}"
+            placeholder="${escapeHtml(t("drawerSearchPlaceholder"))}"
+            aria-label="${escapeHtml(t("drawerTabSearch"))}"
+          />
+        </div>
+        <div data-drawer-search-results style="display:flex;flex-direction:column;gap:12px">
+          ${renderDrawerSearchResultsHtml(d)}
+        </div>
+      `;
+    } else if (d.activeTab === "preview") {
       if (d.previewLoading) {
         bodyHtml = `<div class="mh-empty"><p>${escapeHtml(t("loading"))}</p></div>`;
       } else if (d.previewError) {
@@ -2466,6 +2744,11 @@ export function mountMcpHub(container, bridge) {
       }
     } else {
       bodyHtml = `
+        ${
+          d.pickedFrom
+            ? `<div class="mh-prefill-banner">${iconSvg("spark", 14)}<span>${escapeHtml(t("drawerSearchPickedBanner", { name: d.pickedFrom }))}</span></div>`
+            : ""
+        }
         ${d.formError ? `<div class="mh-error-banner">${escapeHtml(d.formError)}</div>` : ""}
         <div class="mh-field">
           <label class="mh-label" for="mh-f-name">${escapeHtml(t("fieldName"))}</label>
@@ -2588,8 +2871,17 @@ export function mountMcpHub(container, bridge) {
           </div>
           <div class="mh-drawer-subbar">
             <div class="mh-seg-tabs" role="tablist">
+              ${
+                !d.isEdit
+                  ? `
+                    <button type="button" role="tab" aria-selected="${d.activeTab === "search"}" class="mh-tab${d.activeTab === "search" ? " is-active" : ""}" data-action="drawer-tab" data-tab="search">
+                      ${iconSvg("search", 13)}<span>${escapeHtml(t("drawerTabSearch"))}</span>
+                    </button>
+                  `
+                  : ""
+              }
               <button type="button" role="tab" aria-selected="${d.activeTab === "form"}" class="mh-tab${d.activeTab === "form" ? " is-active" : ""}" data-action="drawer-tab" data-tab="form">
-                ${iconSvg("edit", 13)}<span>${escapeHtml(t("drawerTabForm"))}</span>
+                ${iconSvg("edit", 13)}<span>${escapeHtml(t(d.isEdit ? "drawerTabForm" : "drawerTabManual"))}</span>
               </button>
               <button type="button" role="tab" aria-selected="${d.activeTab === "preview"}" class="mh-tab${d.activeTab === "preview" ? " is-active" : ""}" data-action="drawer-tab" data-tab="preview">
                 ${iconSvg("code", 13)}<span>${escapeHtml(t("drawerTabPreview"))}</span>
@@ -2615,15 +2907,33 @@ export function mountMcpHub(container, bridge) {
           </div>
           <div class="mh-modal-body">${bodyHtml}</div>
           <div class="mh-modal-foot">
-            <button type="button" class="mh-btn mh-btn--sm" data-action="drawer-test" ${d.probing ? "disabled" : ""}>
-              ${iconSvg("radar", 13)}<span>${escapeHtml(d.probing ? t("probing") : t("testConnection"))}</span>
-            </button>
-            <div class="mh-modal-foot-right">
-              <button type="button" class="mh-btn" data-action="close-drawer">${escapeHtml(t("cancel"))}</button>
-              <button type="button" class="mh-btn mh-btn--primary" data-action="drawer-save" ${state.busy ? "disabled" : ""}>
-                ${iconSvg("check", 14)}<span>${escapeHtml(state.busy ? t("saving") : t("save"))}</span>
-              </button>
-            </div>
+            ${
+              d.activeTab === "search" && !d.isEdit
+                ? `
+                  <div style="display:inline-flex;align-items:center;gap:6px">
+                    <button type="button" class="mh-btn mh-btn--sm" data-action="drawer-open-import">
+                      ${iconSvg("upload", 13)}<span>${escapeHtml(t("importJson"))}</span>
+                    </button>
+                    <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="drawer-tab" data-tab="form">
+                      ${iconSvg("edit", 13)}<span>${escapeHtml(t("drawerSwitchManual"))}</span>
+                    </button>
+                  </div>
+                  <div class="mh-modal-foot-right">
+                    <button type="button" class="mh-btn" data-action="close-drawer">${escapeHtml(t("close"))}</button>
+                  </div>
+                `
+                : `
+                  <button type="button" class="mh-btn mh-btn--sm" data-action="drawer-test" ${d.probing ? "disabled" : ""}>
+                    ${iconSvg("radar", 13)}<span>${escapeHtml(d.probing ? t("probing") : t("testConnection"))}</span>
+                  </button>
+                  <div class="mh-modal-foot-right">
+                    <button type="button" class="mh-btn" data-action="close-drawer">${escapeHtml(t("cancel"))}</button>
+                    <button type="button" class="mh-btn mh-btn--primary" data-action="drawer-save" ${state.busy ? "disabled" : ""}>
+                      ${iconSvg("check", 14)}<span>${escapeHtml(state.busy ? t("saving") : t("save"))}</span>
+                    </button>
+                  </div>
+                `
+            }
           </div>
         </aside>
       </div>
@@ -3094,11 +3404,45 @@ export function mountMcpHub(container, bridge) {
   // -------------------------------------------------------------------------
 
   root.addEventListener(
+    "compositionstart",
+    (event) => {
+      const target = event.target;
+      if (target instanceof win.HTMLElement && target.hasAttribute("data-drawer-search-input")) {
+        isComposingDrawerSearch = true;
+      }
+    },
+    { signal },
+  );
+
+  root.addEventListener(
+    "compositionend",
+    (event) => {
+      const target = event.target;
+      if (
+        target instanceof win.HTMLElement &&
+        target.hasAttribute("data-drawer-search-input") &&
+        state.drawer?.mode === "editor"
+      ) {
+        isComposingDrawerSearch = false;
+        state.drawer.searchQuery = target.value;
+        scheduleDrawerSearch();
+      }
+    },
+    { signal },
+  );
+
+  root.addEventListener(
     "input",
     (event) => {
       const target = event.target;
       if (!(target instanceof win.HTMLElement)) return;
       if (target === slots.searchInput) return;
+
+      if (target.hasAttribute("data-drawer-search-input") && state.drawer?.mode === "editor") {
+        state.drawer.searchQuery = target.value;
+        if (!isComposingDrawerSearch) scheduleDrawerSearch();
+        return;
+      }
 
       if (target.dataset.toolSearch) {
         const name = target.dataset.toolSearch;
@@ -3296,6 +3640,16 @@ export function mountMcpHub(container, bridge) {
     (event) => {
       const target = event.target;
       if (!(target instanceof win.HTMLElement)) return;
+
+      if (event.key === "Enter" && target.hasAttribute("data-drawer-search-input") && state.drawer?.mode === "editor") {
+        event.preventDefault();
+        if (drawerSearchDebounceTimer) {
+          clearTimeout(drawerSearchDebounceTimer);
+          drawerSearchDebounceTimer = null;
+        }
+        runDrawerSearch(state.drawer.searchQuery);
+        return;
+      }
 
       if (event.key === "Enter" && target.dataset.drawerField === "quickCmd" && state.drawer?.mode === "editor") {
         event.preventDefault();
@@ -3827,8 +4181,42 @@ export function mountMcpHub(container, bridge) {
           if (nextTab && nextTab !== state.drawer.activeTab) {
             state.drawer.activeTab = nextTab;
             if (nextTab === "preview") await refreshDrawerPreview();
-            else renderDrawer();
+            else {
+              renderDrawer();
+              if (nextTab === "search") {
+                slots.drawer.querySelector("[data-drawer-search-input]")?.focus();
+              }
+            }
           }
+          return;
+        }
+
+        if (action === "drawer-quick-search") {
+          const term = el.dataset.term ?? "";
+          state.drawer.searchQuery = term;
+          const inputEl = slots.drawer.querySelector("[data-drawer-search-input]");
+          if (inputEl) {
+            inputEl.value = term;
+            inputEl.focus();
+          }
+          await runDrawerSearch(term);
+          return;
+        }
+
+        if (action === "drawer-pick-item") {
+          const idx = el.dataset.pickIdx;
+          const item =
+            idx === "smart"
+              ? state.drawer.searchSmartMatch
+              : (state.drawer._resolvedSearchItems ?? [])[Number(idx)];
+          if (item) applyDrawerPickedItem(item);
+          return;
+        }
+
+        if (action === "drawer-open-import") {
+          state.drawer = null;
+          renderDrawer();
+          openImportModal();
           return;
         }
 
@@ -4149,6 +4537,7 @@ export function mountMcpHub(container, bridge) {
     if (toastTimer) clearTimeout(toastTimer);
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
     if (registryDebounceTimer) clearTimeout(registryDebounceTimer);
+    if (drawerSearchDebounceTimer) clearTimeout(drawerSearchDebounceTimer);
     if (livePollTimer) clearInterval(livePollTimer);
     if (rafId !== null && typeof win?.cancelAnimationFrame === "function") {
       win.cancelAnimationFrame(rafId);

@@ -1,9 +1,10 @@
 /**
  * Live Official MCP Registry Search & Smart Address Resolver (pure Node fetch, zero subprocesses).
  *
- * Inspired by Magpie's MCP Market:
- * - Searches the official Model Context Protocol Registry (`registry.modelcontextprotocol.io`)
- *   with bounded TTL caching and graceful offline degradation.
+ * Inspired by Magpie's MCP Market (`internal/library/market.go`):
+ * - Queries the official Model Context Protocol Registry (`registry.modelcontextprotocol.io`)
+ *   with `version=latest`, filters out non-active versions, ranks exact/official matches above
+ *   third-party wrappers (`ai.smithery/*`), and caches responses with bounded TTL.
  * - Directly resolves pasted remote MCP URLs (`https://...`), npm packages (`@scope/pkg` or
  *   `npmjs.com/package/...`), PyPI packages (`pypi.org/project/...`), or GitHub repositories
  *   (`https://github.com/owner/repo` or `owner/repo`) into ready-to-install MCP server configs.
@@ -19,6 +20,111 @@ const NPM_PKG_RE = /^(@[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*)(?:@([a-z0-9._
 const OWNER_REPO_RE = /^([A-Za-z0-9][A-Za-z0-9_.-]*)\/([A-Za-z0-9_.-]+)$/u;
 
 const GENERIC_SLUGS = new Set(["mcp", "mcp-server", "server", "agent-toolkit", "toolkit", "cli"]);
+
+function extractPublisher(fullName) {
+  const s = String(fullName ?? "").trim();
+  const slash = s.indexOf("/");
+  if (slash <= 0) return "";
+  const ns = s.slice(0, slash);
+  return ns
+    .replace(/^io\.github\./iu, "")
+    .replace(/^(?:com|org|io|ai|app|dev|net)\./iu, "");
+}
+
+function serverDedupeKey(item) {
+  if (!item) return "";
+  if (item.url) {
+    return `url:${String(item.url).trim().replace(/\/+$/u, "").toLowerCase()}`;
+  }
+  const cmd = String(item.command ?? "").trim().toLowerCase();
+  const args = Array.isArray(item.args)
+    ? item.args.map((a) => String(a).trim().toLowerCase()).join(" ")
+    : "";
+  return `cmd:${cmd}:${args}`;
+}
+
+function isWordBoundaryMatch(text, query) {
+  const hay = String(text ?? "").toLowerCase();
+  const q = String(query ?? "").toLowerCase();
+  if (!q || !hay) return false;
+  let pos = 0;
+  while (pos < hay.length) {
+    const idx = hay.indexOf(q, pos);
+    if (idx < 0) return false;
+    const before = idx === 0 || !/[a-z0-9]/u.test(hay[idx - 1]);
+    const afterIdx = idx + q.length;
+    const after = afterIdx >= hay.length || !/[a-z0-9]/u.test(hay[afterIdx]);
+    if (before && after) return true;
+    pos = idx + 1;
+  }
+  return false;
+}
+
+function scoreFieldMatch(field, q) {
+  const f = String(field ?? "").trim().toLowerCase();
+  if (!f || !q) return 0;
+  if (f === q) return 10_000;
+  if (f.startsWith(q)) return 8_000;
+  if (isWordBoundaryMatch(f, q)) return 7_000;
+  if (f.includes(q)) return 6_000;
+  return 0;
+}
+
+/**
+ * Score a catalog/registry item for relevance against a user's search query.
+ * Exact/prefix name matches and official entries outrank generic third-party wrappers.
+ */
+export function rankCatalogEntry(item, rawQuery) {
+  const q = String(rawQuery ?? "").trim().toLowerCase();
+  if (!q) return item?.source === "featured" ? 100 : 10;
+
+  const pkgArg = Array.isArray(item.args)
+    ? item.args.find((a) => a && !String(a).startsWith("-")) ?? ""
+    : "";
+  const regShort = item.registryName
+    ? String(item.registryName).split("/").pop() ?? ""
+    : "";
+  const publisher = item.publisher ?? extractPublisher(item.registryName);
+
+  let score = 0;
+  for (const field of [item.id, item.name, regShort, pkgArg, publisher]) {
+    score = Math.max(score, scoreFieldMatch(field, q));
+  }
+
+  const descEn = item.description?.en ?? "";
+  const descZh = item.description?.["zh-CN"] ?? "";
+  if (score === 0) {
+    if (isWordBoundaryMatch(descEn, q) || descZh.toLowerCase().includes(q)) {
+      score = 1_500;
+    } else if (q.length >= 3 && descEn.toLowerCase().includes(q)) {
+      score = 800;
+    }
+  } else if (
+    descEn.toLowerCase().includes(q) ||
+    descZh.toLowerCase().includes(q)
+  ) {
+    score += 120;
+  }
+
+  if (score === 0) return 0;
+
+  // Quality & official-origin adjustments (mirroring Magpie's `rank()`).
+  if (item.source === "featured") score += 250;
+  if (item.repoUrl) score += 25;
+  if (item.transport === "http") score += 15;
+  if (typeof item.registryName === "string") {
+    const lowerReg = item.registryName.toLowerCase();
+    // Direct official namespace (e.g. `com.stripe/mcp` for query `stripe`).
+    if (lowerReg === `com.${q}/mcp` || lowerReg === `io.${q}/mcp` || lowerReg.startsWith(`com.${q}/`)) {
+      score += 400;
+    }
+    // Demote third-party wrappers so official servers rank first.
+    if (lowerReg.startsWith("ai.smithery/")) {
+      score -= 1_500;
+    }
+  }
+  return score;
+}
 
 function slugifyServerId(raw) {
   const str = String(raw ?? "").trim().toLowerCase();
@@ -94,6 +200,7 @@ export function normalizeRegistryEntry(rawItem) {
   if (!fullName) return null;
 
   const baseId = slugifyServerId(fullName);
+  const publisher = extractPublisher(fullName);
   const displayName =
     (typeof srv.title === "string" && srv.title.trim()) ||
     titleFromId(baseId);
@@ -116,6 +223,7 @@ export function normalizeRegistryEntry(rawItem) {
     return {
       id: baseId,
       registryName: fullName,
+      ...(publisher ? { publisher } : {}),
       name: displayName,
       source: "registry",
       category: "registry",
@@ -183,6 +291,7 @@ export function normalizeRegistryEntry(rawItem) {
   return {
     id: baseId,
     registryName: fullName,
+    ...(publisher ? { publisher } : {}),
     name: displayName,
     source: "registry",
     category: "local",
@@ -368,17 +477,17 @@ export async function searchMcpRegistry(
 
   try {
     const url = new URL(baseUrl);
-    if (q && !smart) {
-      url.searchParams.set("search", q);
-    } else if (q && smart?.repoUrl) {
-      // Also query registry by repo slug so official metadata surfaces alongside smart entry.
-      url.searchParams.set("search", smart.id);
+    const searchTerm = q && !smart ? q : smart?.id ?? "";
+    if (searchTerm) {
+      url.searchParams.set("search", searchTerm);
     }
-    url.searchParams.set("limit", String(Math.min(Math.max(1, limit), 40)));
+    const fetchLimit = Math.min(Math.max(limit * 4, 50), 100);
+    url.searchParams.set("limit", String(fetchLimit));
+    url.searchParams.set("version", "latest");
 
     const res = await fetchImpl(url.href, {
       method: "GET",
-      headers: { Accept: "application/json", "User-Agent": "codexhost-mcp-hub/1.3.0" },
+      headers: { Accept: "application/json", "User-Agent": "codexhost-mcp-hub/1.3.1" },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
@@ -394,15 +503,23 @@ export async function searchMcpRegistry(
           ? json
           : [];
 
-    const seenIds = new Set();
+    const seenKeys = new Set();
+    const scored = [];
     for (const raw of rawList) {
+      const status = raw?._meta?.["io.modelcontextprotocol.registry/official"]?.status;
+      if (status && status !== "active") continue;
       const normalized = normalizeRegistryEntry(raw);
       if (!normalized) continue;
-      const dedupeKey = `${normalized.id}:${normalized.url ?? normalized.command ?? ""}`;
-      if (seenIds.has(dedupeKey)) continue;
-      seenIds.add(dedupeKey);
-      items.push(normalized);
+      const dedupeKey = serverDedupeKey(normalized) || `${normalized.id}:${normalized.registryName ?? ""}`;
+      if (seenKeys.has(dedupeKey)) continue;
+      seenKeys.add(dedupeKey);
+      const score = searchTerm ? rankCatalogEntry(normalized, searchTerm) : 10;
+      scored.push({ item: normalized, score });
     }
+    if (searchTerm) {
+      scored.sort((a, b) => b.score - a.score);
+    }
+    items = scored.slice(0, Math.min(Math.max(1, limit), 40)).map((entry) => entry.item);
   } catch (error) {
     offline = true;
     errorMessage = error instanceof Error ? error.message : String(error);

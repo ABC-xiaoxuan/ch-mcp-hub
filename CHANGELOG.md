@@ -5,6 +5,25 @@ All notable changes to **MCP Hub (`ch-mcp-hub`)** are documented in this file.
 
 ---
 
+## [1.3.1] - 2026-11-28
+
+### ✨ 新增功能（Added）
+- **「添加 MCP」内置按名称即时搜索（对标 Magpie 搜索添加体验）**
+  - 点击顶部「+ 添加 MCP」（或按快捷键 `N`）默认打开「搜索添加」标签页并自动聚焦搜索框，输入任意 MCP 名称（如 `stripe`、`postgres`、`tavily`、`slack`、`deepwiki`）或粘贴远程 URL / `@scope/pkg` / GitHub `owner/repo` 即可实时搜索并一键选中预填到配置表单。
+  - 搜索过程采用局部 DOM 更新与 IME 组合输入保护，全程零失焦；选中后自动携带名称、端点/启动命令与环境变量提示切入配置表单，确认目标客户端即可保存。
+  - 空搜索态提供热门快捷搜索标签与精选推荐，底栏支持一键切回「手动填写」或「导入 JSON」。
+- **内置精选预设扩充至 22 款**：在原有 12 款基础上新增 **Chrome DevTools、DeepWiki、Exa Search、Stripe、Vercel、Cloudflare、PostgreSQL、Tavily Search、Git、Time** 10 款高频开发者 MCP，支持 0 ms 本地瞬时匹配。
+
+### 🚀 检索精度优化（Improved）
+- **官方 MCP Registry 相关性排序与去重升级**（借鉴 Magpie `market.go` 策略）：
+  - 查询官方 `registry.modelcontextprotocol.io/v0/servers` 自动附加 `version=latest` 并过滤非 `active` 状态版本，彻底消除同名旧版本重复刷屏。
+  - 引入多维度相关性打分（精确名 > 前缀 > 词边界 > 描述；官方命名空间 `com.<q>/mcp` 加权，第三方封装 `ai.smithery/*` 降权），按端点/包名去重后将官方原版服务稳定排在首位。
+
+### ✅ 测试与安全（Testing & Security）
+- 新增官方 Registry `version=latest`、非活跃过滤及相关性排序单元测试（**17 / 17 全部通过**），并通过 8 维度视觉审计与独立 CodexHost Web 真机交互验证。
+
+---
+
 ## [1.3.0] - 2026-11-28
 
 ### ✨ 新增功能（Added）

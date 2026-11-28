@@ -616,6 +616,63 @@ describe("Official MCP Registry search & Smart URL/Package/Repo resolver", () =>
     assert.equal(res2.cached, true);
     assert.equal(calls, 1);
   });
+
+  it("requests version=latest, filters inactive entries, deduplicates, and ranks official matches first", async () => {
+    let requestedUrl = "";
+    const fakeFetch = async (url) => {
+      requestedUrl = String(url);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          servers: [
+            {
+              _meta: { "io.modelcontextprotocol.registry/official": { status: "deleted" } },
+              server: {
+                name: "com.stripe/old-deleted",
+                title: "Stripe",
+                remotes: [{ type: "streamable-http", url: "https://deleted.stripe.com/" }],
+              },
+            },
+            {
+              _meta: { "io.modelcontextprotocol.registry/official": { status: "active" } },
+              server: {
+                name: "ai.smithery/smithery-stripe",
+                title: "Stripe Wrapper",
+                description: "Third-party wrapper for Stripe",
+                remotes: [{ type: "streamable-http", url: "https://server.smithery.ai/stripe" }],
+              },
+            },
+            {
+              _meta: { "io.modelcontextprotocol.registry/official": { status: "active" } },
+              server: {
+                name: "com.stripe/mcp",
+                title: "Stripe",
+                description: "Official Stripe payments MCP",
+                remotes: [{ type: "streamable-http", url: "https://mcp.stripe.com/" }],
+              },
+            },
+            {
+              _meta: { "io.modelcontextprotocol.registry/official": { status: "active" } },
+              server: {
+                name: "com.stripe/mcp-dup",
+                title: "Stripe Duplicate",
+                remotes: [{ type: "streamable-http", url: "https://mcp.stripe.com" }],
+              },
+            },
+          ],
+        }),
+      };
+    };
+
+    const res = await searchMcpRegistry("stripe", {
+      fetchImpl: fakeFetch,
+      baseUrl: "https://mock.registry.local/v0/servers",
+    });
+    assert.match(requestedUrl, /version=latest/);
+    assert.equal(res.items.length, 2, "Deleted entry and duplicate URL should be filtered");
+    assert.equal(res.items[0].registryName, "com.stripe/mcp", "Official com.stripe/mcp must outrank ai.smithery wrapper");
+  });
 });
 
 describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch probe", () => {

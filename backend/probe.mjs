@@ -212,7 +212,7 @@ async function probeRemoteServer(server) {
         params: {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: "codexhost-mcp-hub", version: "1.3.0" },
+          clientInfo: { name: "codexhost-mcp-hub", version: "1.3.1" },
         },
       }),
       signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
