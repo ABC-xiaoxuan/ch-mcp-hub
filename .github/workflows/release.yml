@@ -32,6 +32,12 @@ jobs:
       - name: Run unit tests & performance checks
         run: npm test
 
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/extract-release-notes.mjs "$VERSION" > /tmp/release-notes.md
+          cat /tmp/release-notes.md
+
       - name: Pack and statically audit release bundle
         run: npm run pack
 
@@ -46,4 +52,4 @@ jobs:
             "dist/preview-dark.png" \
             "dist/preview-light.png" \
             --title "MCP Hub ${GITHUB_REF_NAME}" \
-            --generate-notes
+            --notes-file /tmp/release-notes.md

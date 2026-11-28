@@ -10,6 +10,7 @@
  * - Discovers Global MCPs, Claude project-scoped MCPs, and Antigravity/Claude native plugins.
  */
 
+import { randomUUID } from "node:crypto";
 import { watch } from "node:fs";
 import { mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -116,6 +117,56 @@ export function countHardcodedSecrets(instances) {
   return seen.size;
 }
 
+const ENV_REF_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/gu;
+
+export function findMissingEnvVars(instances, runtimeEnv = process.env) {
+  const missing = new Set();
+  const scanString = (str) => {
+    if (typeof str !== "string" || !str.includes("${")) return;
+    ENV_REF_RE.lastIndex = 0;
+    let m;
+    while ((m = ENV_REF_RE.exec(str)) !== null) {
+      const varName = m[1];
+      const val = runtimeEnv?.[varName];
+      if (val === undefined || String(val).trim() === "") {
+        missing.add(varName);
+      }
+    }
+  };
+  for (const inst of Object.values(instances ?? {})) {
+    if (!inst || typeof inst !== "object") continue;
+    scanString(inst.url);
+    for (const arg of inst.args ?? []) scanString(arg);
+    for (const v of Object.values(inst.headers ?? {})) scanString(v);
+    for (const v of Object.values(inst.env ?? {})) scanString(v);
+    if (typeof inst.bearerTokenEnvVar === "string" && inst.bearerTokenEnvVar.trim()) {
+      const varName = inst.bearerTokenEnvVar.trim();
+      const val = runtimeEnv?.[varName];
+      if (val === undefined || String(val).trim() === "") {
+        missing.add(varName);
+      }
+    }
+  }
+  return [...missing].sort();
+}
+
+export function normalizeToolList(arr) {
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  for (const item of arr) {
+    const name = String(item ?? "").trim();
+    if (name && name.length <= 128) seen.add(name);
+  }
+  return [...seen].sort();
+}
+
+function normalizePositiveTimeout(value, max) {
+  if (value === undefined || value === null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.min(Math.round(n), max);
+}
+
 function shellQuote(arg) {
   return /^[A-Za-z0-9._:/-]+$/u.test(arg) ? arg : JSON.stringify(arg);
 }
@@ -152,6 +203,21 @@ export function normalizeServerInput(input) {
   const transport =
     input?.transport === "http" || input?.transport === "sse" ? input.transport : "stdio";
   const enabled = input?.enabled !== false;
+  const hasStartupField = input && Object.hasOwn(input, "startupTimeoutSec");
+  const hasToolTimeoutField = input && Object.hasOwn(input, "toolTimeoutSec");
+  const hasDisabledToolsField = input && Object.hasOwn(input, "disabledTools");
+  const startupTimeoutSec = normalizePositiveTimeout(input?.startupTimeoutSec, 600);
+  const toolTimeoutSec = normalizePositiveTimeout(input?.toolTimeoutSec, 3600);
+  const disabledTools = normalizeToolList(input?.disabledTools);
+  const optionalExtras = {
+    ...(hasStartupField ? { startupTimeoutSec } : startupTimeoutSec ? { startupTimeoutSec } : {}),
+    ...(hasToolTimeoutField ? { toolTimeoutSec } : toolTimeoutSec ? { toolTimeoutSec } : {}),
+    ...(hasDisabledToolsField
+      ? { disabledTools }
+      : disabledTools.length > 0
+        ? { disabledTools }
+        : {}),
+  };
 
   if (transport === "http" || transport === "sse") {
     const url = String(input?.url ?? "").trim();
@@ -175,6 +241,7 @@ export function normalizeServerInput(input) {
       url: parsed.href,
       headers: normalizeStringMap(input?.headers),
       ...(bearer ? { bearerTokenEnvVar: bearer } : {}),
+      ...optionalExtras,
       enabled,
     };
   }
@@ -187,6 +254,7 @@ export function normalizeServerInput(input) {
     command,
     args: normalizeStringArray(input?.args),
     env: normalizeStringMap(input?.env),
+    ...optionalExtras,
     enabled,
   };
 }
@@ -378,6 +446,8 @@ function encodeClaudeEntry(server, previousRaw = {}) {
 function decodeAntigravityEntry(name, raw) {
   if (!raw || typeof raw !== "object") return null;
   const enabled = raw.disabled !== true && raw.enabled !== false;
+  const disabledTools = normalizeToolList(raw.excludeTools ?? raw.disabledTools);
+  const extraTools = disabledTools.length > 0 ? { disabledTools } : {};
   const url =
     typeof raw.url === "string"
       ? raw.url.trim()
@@ -390,6 +460,7 @@ function decodeAntigravityEntry(name, raw) {
       transport: raw.type === "sse" ? "sse" : "http",
       url,
       headers: normalizeStringMap(raw.headers),
+      ...extraTools,
       enabled,
     };
   }
@@ -399,6 +470,7 @@ function decodeAntigravityEntry(name, raw) {
     command: typeof raw.command === "string" ? raw.command : "",
     args: normalizeStringArray(raw.args),
     env: normalizeStringMap(raw.env),
+    ...extraTools,
     enabled,
   };
 }
@@ -413,8 +485,15 @@ function encodeAntigravityEntry(server, previousRaw = {}) {
   delete preserved.headers;
   delete preserved.disabled;
   delete preserved.enabled;
+  if (server.disabledTools !== undefined) {
+    delete preserved.excludeTools;
+  }
 
   const disabledField = server.enabled === false ? { disabled: true } : {};
+  const toolsField =
+    Array.isArray(server.disabledTools) && server.disabledTools.length > 0
+      ? { excludeTools: normalizeToolList(server.disabledTools) }
+      : {};
 
   if (server.transport === "http" || server.transport === "sse") {
     const useLegacyServerUrl =
@@ -423,6 +502,7 @@ function encodeAntigravityEntry(server, previousRaw = {}) {
       ...preserved,
       ...(useLegacyServerUrl ? { serverUrl: server.url } : { url: server.url }),
       ...(Object.keys(server.headers ?? {}).length > 0 ? { headers: server.headers } : {}),
+      ...toolsField,
       ...disabledField,
     };
   }
@@ -431,6 +511,7 @@ function encodeAntigravityEntry(server, previousRaw = {}) {
     command: server.command,
     ...(server.args?.length ? { args: server.args } : {}),
     ...(Object.keys(server.env ?? {}).length > 0 ? { env: server.env } : {}),
+    ...toolsField,
     ...disabledField,
   };
 }
@@ -499,6 +580,14 @@ function encodeOpenCodeEntry(server, previousRaw = {}) {
 function decodeCodexEntry(name, raw) {
   if (!raw || typeof raw !== "object") return null;
   const enabled = raw.enabled !== false;
+  const startupTimeoutSec = normalizePositiveTimeout(raw.startup_timeout_sec, 600);
+  const toolTimeoutSec = normalizePositiveTimeout(raw.tool_timeout_sec, 3600);
+  const disabledTools = normalizeToolList(raw.disabled_tools);
+  const extras = {
+    ...(startupTimeoutSec ? { startupTimeoutSec } : {}),
+    ...(toolTimeoutSec ? { toolTimeoutSec } : {}),
+    ...(disabledTools.length > 0 ? { disabledTools } : {}),
+  };
   const url = typeof raw.url === "string" ? raw.url.trim() : "";
   if (url) {
     return {
@@ -509,6 +598,7 @@ function decodeCodexEntry(name, raw) {
       ...(typeof raw.bearer_token_env_var === "string" && raw.bearer_token_env_var
         ? { bearerTokenEnvVar: raw.bearer_token_env_var }
         : {}),
+      ...extras,
       enabled,
     };
   }
@@ -518,6 +608,7 @@ function decodeCodexEntry(name, raw) {
     command: typeof raw.command === "string" ? raw.command : "",
     args: normalizeStringArray(raw.args),
     env: normalizeStringMap(raw.env),
+    ...extras,
     enabled,
   };
 }
@@ -533,12 +624,24 @@ function encodeCodexEntry(server, previousRaw = {}) {
   delete preserved.headers;
   delete preserved.bearer_token_env_var;
   delete preserved.enabled;
+  if (server.startupTimeoutSec !== undefined) delete preserved.startup_timeout_sec;
+  if (server.toolTimeoutSec !== undefined) delete preserved.tool_timeout_sec;
+  if (server.disabledTools !== undefined) delete preserved.disabled_tools;
+
+  const extraFields = {
+    ...(server.startupTimeoutSec ? { startup_timeout_sec: server.startupTimeoutSec } : {}),
+    ...(server.toolTimeoutSec ? { tool_timeout_sec: server.toolTimeoutSec } : {}),
+    ...(Array.isArray(server.disabledTools) && server.disabledTools.length > 0
+      ? { disabled_tools: normalizeToolList(server.disabledTools) }
+      : {}),
+  };
 
   if (server.transport === "http" || server.transport === "sse") {
     return {
       ...preserved,
       url: server.url,
       ...(server.bearerTokenEnvVar ? { bearer_token_env_var: server.bearerTokenEnvVar } : {}),
+      ...extraFields,
       ...(server.enabled === false ? { enabled: false } : {}),
       ...(Object.keys(server.headers ?? {}).length > 0 ? { http_headers: server.headers } : {}),
     };
@@ -547,6 +650,7 @@ function encodeCodexEntry(server, previousRaw = {}) {
     ...preserved,
     command: server.command,
     ...(server.args?.length ? { args: server.args } : {}),
+    ...extraFields,
     ...(server.enabled === false ? { enabled: false } : {}),
     ...(Object.keys(server.env ?? {}).length > 0 ? { env: server.env } : {}),
   };
@@ -724,6 +828,7 @@ export class McpConfigStore {
     this.backupsDir = path.join(dataDir, "backups");
     this.backupIndexPath = path.join(this.backupsDir, "index.json");
     this.stashPath = path.join(dataDir, "claude-disabled-stash.json");
+    this.hubStatePath = path.join(dataDir, "hub-state.json");
   }
 
   getRevision() {
@@ -841,6 +946,48 @@ export class McpConfigStore {
   async #writeStash(stash) {
     await atomicWriteUtf8(this.stashPath, JSON.stringify(stash, null, 2) + "\n");
     this.#fileCache.invalidate(this.stashPath);
+  }
+
+  async #readHubStateWithSig() {
+    const res = await this.#fileCache.readParsed(this.hubStatePath, (raw) => {
+      const parsed = raw.trim() ? JSON.parse(raw) : {};
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      return parsed;
+    });
+    const raw = res.exists && !res.parseError && res.parsed ? res.parsed : {};
+    return {
+      sig: res.sig,
+      state: {
+        disabledTools:
+          raw.disabledTools && typeof raw.disabledTools === "object" && !Array.isArray(raw.disabledTools)
+            ? raw.disabledTools
+            : {},
+        paused:
+          raw.paused && typeof raw.paused === "object" && !Array.isArray(raw.paused)
+            ? raw.paused
+            : {},
+        accounts:
+          raw.accounts && typeof raw.accounts === "object" && !Array.isArray(raw.accounts)
+            ? raw.accounts
+            : {},
+      },
+    };
+  }
+
+  async #mutateHubState(mutator) {
+    return this.#enqueue("__hub_state__", async () => {
+      const { state } = await this.#readHubStateWithSig();
+      const clone = {
+        disabledTools: { ...state.disabledTools },
+        paused: { ...state.paused },
+        accounts: { ...state.accounts },
+      };
+      const result = await mutator(clone);
+      await atomicWriteUtf8(this.hubStatePath, JSON.stringify(clone, null, 2) + "\n");
+      this.#fileCache.invalidate(this.hubStatePath);
+      this.#bumpRevision();
+      return result;
+    });
   }
 
   // Separated lightweight backup index (`backups/index.json`) + raw payload (`backups/<id>.dat`).
@@ -1042,9 +1189,20 @@ export class McpConfigStore {
         }
       } else if (harnessId === "opencode") {
         const map = doc.mcp && typeof doc.mcp === "object" ? doc.mcp : {};
+        const toolsMap = doc.tools && typeof doc.tools === "object" && !Array.isArray(doc.tools) ? doc.tools : {};
         for (const [name, entry] of Object.entries(map)) {
           const decoded = decodeOpenCodeEntry(name, entry);
-          if (decoded) servers[name] = decoded;
+          if (decoded) {
+            const prefix = `${name}_`;
+            const off = [];
+            for (const [tk, tv] of Object.entries(toolsMap)) {
+              if (tv === false && tk.startsWith(prefix) && tk.length > prefix.length) {
+                off.push(tk.slice(prefix.length));
+              }
+            }
+            if (off.length > 0) decoded.disabledTools = normalizeToolList(off);
+            servers[name] = decoded;
+          }
         }
       }
       return { servers, projectServers };
@@ -1200,16 +1358,30 @@ export class McpConfigStore {
       sigParts.push("agydirs:missing");
     }
 
-    // 2. Claude Code enabledPlugins (`~/.claude/settings.json`)
+    // 2. Claude Code enabledPlugins & MCP tool deny rules (`~/.claude/settings.json`)
     const claudeSettingsPath = path.join(this.homeDir, ".claude", "settings.json");
     const claudeSettingsRes = await this.#fileCache.readParsed(claudeSettingsPath, (raw) => {
       const doc = raw.trim() ? parseJsonFlexible(raw) : {};
-      return doc?.enabledPlugins && typeof doc.enabledPlugins === "object" && !Array.isArray(doc.enabledPlugins)
-        ? doc.enabledPlugins
-        : {};
+      const enabledPlugins =
+        doc?.enabledPlugins && typeof doc.enabledPlugins === "object" && !Array.isArray(doc.enabledPlugins)
+          ? doc.enabledPlugins
+          : {};
+      const denyList = Array.isArray(doc?.permissions?.deny)
+        ? doc.permissions.deny.filter((item) => typeof item === "string" && item.startsWith("mcp__"))
+        : [];
+      return { enabledPlugins, denyList };
     });
     sigParts.push(`claudesettings:${claudeSettingsRes.sig}`);
-    for (const [pluginKey, isEnabled] of Object.entries(claudeSettingsRes.parsed ?? {})) {
+    const claudeDisabledToolsByServer = {};
+    for (const rule of claudeSettingsRes.parsed?.denyList ?? []) {
+      const match = /^mcp__([^_]+(?:_[^_]+)*)__(.+)$/u.exec(rule);
+      if (match) {
+        const [, srvName, toolName] = match;
+        if (!claudeDisabledToolsByServer[srvName]) claudeDisabledToolsByServer[srvName] = [];
+        claudeDisabledToolsByServer[srvName].push(toolName);
+      }
+    }
+    for (const [pluginKey, isEnabled] of Object.entries(claudeSettingsRes.parsed?.enabledPlugins ?? {})) {
       if (typeof isEnabled !== "boolean") continue;
       plugins.push({
         id: pluginKey,
@@ -1223,7 +1395,7 @@ export class McpConfigStore {
 
     plugins.sort((a, b) => a.name.localeCompare(b.name, "en"));
     pluginMcpServers.sort((a, b) => a.name.localeCompare(b.name, "en"));
-    return { plugins, pluginMcpServers, sig: sigParts.join("|") };
+    return { plugins, pluginMcpServers, claudeDisabledToolsByServer, sig: sigParts.join("|") };
   }
 
   async toggleNativePlugin(harnessId, pluginId, enabled) {
@@ -1418,7 +1590,257 @@ export class McpConfigStore {
     if (!current) {
       throw new Error(`Server "${name}" is not configured in ${harnessId}`);
     }
+    if (enabled) {
+      await this.#mutateHubState((st) => {
+        if (Object.hasOwn(st.paused, name)) delete st.paused[name];
+      });
+    }
     return this.upsertServer({ ...current, enabled: Boolean(enabled) }, [harnessId]);
+  }
+
+  /**
+   * Global Pause / Resume for a server across all harnesses while remembering
+   * which harnesses were previously active (inspired by Magpie `mcp_on.go`).
+   */
+  async setServerPaused(serverName, paused) {
+    const name = validateServerName(serverName);
+    const overview = await this.buildOverview({ includeBackups: false });
+    const match = overview.servers.find((s) => s.name === name);
+    if (!match) {
+      throw new Error(`Server "${name}" not found`);
+    }
+
+    if (paused) {
+      const enabledIds = Object.entries(match.instances)
+        .filter(([, inst]) => inst.enabled !== false)
+        .map(([hid]) => hid);
+      await this.#mutateHubState((st) => {
+        st.paused[name] = enabledIds.length > 0 ? enabledIds : Object.keys(match.instances);
+      });
+      for (const [hid, inst] of Object.entries(match.instances)) {
+        if (inst.enabled !== false) {
+          await this.upsertServer({ ...inst, enabled: false }, [hid]);
+        }
+      }
+      return { name, paused: true, rememberedHarnesses: enabledIds };
+    }
+
+    const { state } = await this.#readHubStateWithSig();
+    const remembered = Array.isArray(state.paused[name]) ? state.paused[name] : [];
+    const restoreTargets =
+      remembered.filter((hid) => Object.hasOwn(match.instances, hid)).length > 0
+        ? remembered.filter((hid) => Object.hasOwn(match.instances, hid))
+        : Object.keys(match.instances);
+
+    for (const hid of restoreTargets) {
+      const inst = match.instances[hid];
+      if (inst && inst.enabled === false) {
+        await this.upsertServer({ ...inst, enabled: true }, [hid]);
+      }
+    }
+    await this.#mutateHubState((st) => {
+      delete st.paused[name];
+    });
+    return { name, paused: false, restoredHarnesses: restoreTargets };
+  }
+
+  /**
+   * Set per-tool disable list for one MCP server and write natively to every configured harness:
+   * - Codex: `disabled_tools = [...]` in config.toml
+   * - Claude Code: `permissions.deny` `"mcp__<server>__<tool>"` in ~/.claude/settings.json
+   * - OpenCode: `tools["<server>_<tool>"] = false` in opencode.json
+   * - Antigravity: `excludeTools = [...]` in mcp_config.json
+   */
+  async setDisabledTools(serverName, disabledToolsInput) {
+    const name = validateServerName(serverName);
+    const disabledTools = normalizeToolList(disabledToolsInput);
+    const overview = await this.buildOverview({ includeBackups: false });
+    const match = overview.servers.find((s) => s.name === name);
+    if (!match) {
+      throw new Error(`Server "${name}" not found`);
+    }
+
+    await this.#mutateHubState((st) => {
+      if (disabledTools.length > 0) st.disabledTools[name] = disabledTools;
+      else delete st.disabledTools[name];
+    });
+
+    const paths = await this.#resolvePaths();
+    const configuredIds = Object.keys(match.instances);
+
+    await Promise.all(
+      configuredIds.map(async (hid) => {
+        if (hid === "codex" || hid === "antigravity") {
+          const inst = match.instances[hid];
+          await this.upsertServer({ ...inst, disabledTools }, [hid]);
+          return;
+        }
+
+        if (hid === "opencode") {
+          const configPath = paths.opencode;
+          await this.#enqueue("opencode", async () => {
+            const existingRaw = await readFile(configPath, "utf8").catch(() => null);
+            await this.#createBackup("opencode", configPath, existingRaw, `tools-off:${name}`);
+            const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+            const toolsMap =
+              doc.tools && typeof doc.tools === "object" && !Array.isArray(doc.tools)
+                ? { ...doc.tools }
+                : {};
+            const prefix = `${name}_`;
+            for (const k of Object.keys(toolsMap)) {
+              if (k.startsWith(prefix) && toolsMap[k] === false) {
+                delete toolsMap[k];
+              }
+            }
+            for (const toolName of disabledTools) {
+              toolsMap[`${prefix}${toolName}`] = false;
+            }
+            if (Object.keys(toolsMap).length > 0) doc.tools = toolsMap;
+            else delete doc.tools;
+            await atomicWriteUtf8(configPath, JSON.stringify(doc, null, 2) + "\n");
+            this.#fileCache.invalidate(configPath);
+            this.#bumpRevision();
+          });
+          return;
+        }
+
+        if (hid === "claude-code") {
+          const settingsPath = path.join(this.homeDir, ".claude", "settings.json");
+          await this.#enqueue("plugin:claude-code", async () => {
+            const existingRaw = await readFile(settingsPath, "utf8").catch(() => null);
+            await this.#createBackup("claude-code", settingsPath, existingRaw, `tools-off:${name}`);
+            const doc = existingRaw && existingRaw.trim() ? parseJsonFlexible(existingRaw) : {};
+            if (!doc.permissions || typeof doc.permissions !== "object" || Array.isArray(doc.permissions)) {
+              doc.permissions = {};
+            }
+            const prefix = `mcp__${name}__`;
+            const existingDeny = Array.isArray(doc.permissions.deny) ? doc.permissions.deny : [];
+            const kept = existingDeny.filter((item) => typeof item !== "string" || !item.startsWith(prefix));
+            const nextDeny = [...kept, ...disabledTools.map((tName) => `${prefix}${tName}`)];
+            if (nextDeny.length > 0) {
+              doc.permissions.deny = nextDeny;
+            } else {
+              delete doc.permissions.deny;
+              if (Object.keys(doc.permissions).length === 0) delete doc.permissions;
+            }
+            await atomicWriteUtf8(settingsPath, JSON.stringify(doc, null, 2) + "\n");
+            this.#fileCache.invalidate(settingsPath);
+            this.#bumpRevision();
+          });
+        }
+      }),
+    );
+
+    return { name, disabledTools, targets: configuredIds };
+  }
+
+  /**
+   * Multi-account / multi-environment credential profile management per server
+   * (inspired by Magpie `mcp_accounts.go`).
+   */
+  async saveServerAccount({ serverName, id = null, name, headers = null, env = null, activate = true }) {
+    const srvName = validateServerName(serverName);
+    const label = String(name ?? "").trim().slice(0, 60);
+    if (!label) throw new Error("Account profile name is required");
+
+    const overview = await this.buildOverview({ includeBackups: false });
+    const match = overview.servers.find((s) => s.name === srvName);
+    if (!match) throw new Error(`Server "${srvName}" not found`);
+
+    const primary = match.instances[match.primaryHarnessId] ?? match;
+    const isRemote = primary.transport === "http" || primary.transport === "sse";
+    const nextHeaders =
+      headers !== null && headers !== undefined
+        ? normalizeStringMap(headers)
+        : isRemote
+          ? normalizeStringMap(primary.headers)
+          : {};
+    const nextEnv =
+      env !== null && env !== undefined
+        ? normalizeStringMap(env)
+        : !isRemote
+          ? normalizeStringMap(primary.env)
+          : {};
+
+    const profileId = id && typeof id === "string" ? id.trim() : `acc_${randomUUID().slice(0, 8)}`;
+    const nowIso = new Date().toISOString();
+
+    await this.#mutateHubState((st) => {
+      const prev = st.accounts[srvName] ?? { activeId: null, profiles: [] };
+      const profiles = Array.isArray(prev.profiles) ? [...prev.profiles] : [];
+      const idx = profiles.findIndex((p) => p.id === profileId);
+      const record = {
+        id: profileId,
+        name: label,
+        headers: nextHeaders,
+        env: nextEnv,
+        updatedAt: nowIso,
+      };
+      if (idx >= 0) profiles[idx] = record;
+      else profiles.push(record);
+      st.accounts[srvName] = {
+        activeId: activate ? profileId : prev.activeId,
+        profiles,
+      };
+    });
+
+    if (activate) {
+      await this.switchServerAccount(srvName, profileId);
+    }
+
+    return { serverName: srvName, id: profileId, name: label, activated: Boolean(activate) };
+  }
+
+  async switchServerAccount(serverName, accountId) {
+    const srvName = validateServerName(serverName);
+    const targetId = String(accountId ?? "").trim();
+    const { state } = await this.#readHubStateWithSig();
+    const bucket = state.accounts[srvName];
+    const profile = (bucket?.profiles ?? []).find((p) => p.id === targetId);
+    if (!profile) throw new Error(`Account profile "${targetId}" not found for "${srvName}"`);
+
+    const overview = await this.buildOverview({ includeBackups: false });
+    const match = overview.servers.find((s) => s.name === srvName);
+    if (!match) throw new Error(`Server "${srvName}" not found`);
+
+    const configuredIds = Object.keys(match.instances);
+    for (const hid of configuredIds) {
+      const inst = match.instances[hid];
+      const isRemote = inst.transport === "http" || inst.transport === "sse";
+      await this.upsertServer(
+        {
+          ...inst,
+          ...(isRemote
+            ? { headers: { ...(inst.headers ?? {}), ...(profile.headers ?? {}) } }
+            : { env: { ...(inst.env ?? {}), ...(profile.env ?? {}) } }),
+        },
+        [hid],
+      );
+    }
+
+    await this.#mutateHubState((st) => {
+      const prev = st.accounts[srvName] ?? { activeId: null, profiles: [] };
+      st.accounts[srvName] = { ...prev, activeId: targetId };
+    });
+
+    return { serverName: srvName, accountId: targetId, accountName: profile.name, targets: configuredIds };
+  }
+
+  async deleteServerAccount(serverName, accountId) {
+    const srvName = validateServerName(serverName);
+    const targetId = String(accountId ?? "").trim();
+    await this.#mutateHubState((st) => {
+      const prev = st.accounts[srvName];
+      if (!prev) return;
+      const profiles = (prev.profiles ?? []).filter((p) => p.id !== targetId);
+      const activeId = prev.activeId === targetId ? null : prev.activeId;
+      if (profiles.length === 0) {
+        delete st.accounts[srvName];
+      } else {
+        st.accounts[srvName] = { activeId, profiles };
+      }
+    });
+    return { serverName: srvName, deletedId: targetId };
   }
 
   async syncServer(serverName, sourceHarnessId, targetHarnessIds) {
@@ -1515,15 +1937,17 @@ export class McpConfigStore {
     const t0 = performance.now();
     // Single-pass path resolution avoids 4x redundant opencode candidate stat probes.
     const paths = await this.#resolvePaths();
-    const [snapshots, nativePlugins, backupIndex] = await Promise.all([
+    const [snapshots, nativePlugins, backupIndex, hubStateRes] = await Promise.all([
       Promise.all(HARNESS_IDS.map((id) => this.readHarness(id, paths))),
       this.readNativePlugins(),
       this.#loadBackupIndex(),
+      this.#readHubStateWithSig(),
     ]);
+    const hubState = hubStateRes.state;
 
     const cacheHits = snapshots.filter((s) => s.cacheHit).length;
     const backupCount = backupIndex.length;
-    const memoSig = `${snapshots.map((s) => s.sig).join("|")}::${nativePlugins.sig}::${
+    const memoSig = `${snapshots.map((s) => s.sig).join("|")}::${nativePlugins.sig}::${hubStateRes.sig}::${
       includeBackups ? `full:${this.#backupVersion}:${backupCount}` : `cnt:${this.#backupVersion}:${backupCount}`
     }`;
 
@@ -1580,6 +2004,36 @@ export class McpConfigStore {
       .map((group) => {
         const drift = computeServerDrift(group.instances);
         const secretCount = countHardcodedSecrets(group.instances);
+        const missingEnvVars = findMissingEnvVars(group.instances);
+        const mergedDisabled = new Set(hubState.disabledTools[group.name] ?? []);
+        for (const inst of Object.values(group.instances)) {
+          for (const tName of inst.disabledTools ?? []) mergedDisabled.add(tName);
+        }
+        for (const tName of nativePlugins.claudeDisabledToolsByServer?.[group.name] ?? []) {
+          mergedDisabled.add(tName);
+        }
+        const disabledTools = [...mergedDisabled].sort();
+        const pausedHarnesses = Array.isArray(hubState.paused[group.name])
+          ? hubState.paused[group.name]
+          : [];
+        const allDisabled = Object.values(group.instances).every((inst) => inst.enabled === false);
+        const isPaused = allDisabled && pausedHarnesses.length > 0;
+
+        const codexInst = group.instances.codex;
+        const startupTimeoutSec = codexInst?.startupTimeoutSec ?? group.primary.startupTimeoutSec ?? null;
+        const toolTimeoutSec = codexInst?.toolTimeoutSec ?? group.primary.toolTimeoutSec ?? null;
+
+        const accBucket = hubState.accounts[group.name];
+        const accounts = (accBucket?.profiles ?? []).map((p) => ({
+          id: p.id,
+          name: p.name,
+          active: accBucket?.activeId === p.id,
+          headerKeys: Object.keys(p.headers ?? {}),
+          envKeys: Object.keys(p.env ?? {}),
+          updatedAt: p.updatedAt ?? null,
+        }));
+        const activeAccount = accounts.find((a) => a.active) ?? null;
+
         const cliHints = {};
         for (const hid of HARNESS_IDS) {
           cliHints[hid] = {
@@ -1598,6 +2052,14 @@ export class McpConfigStore {
           env: group.primary.env ?? {},
           headers: group.primary.headers ?? {},
           bearerTokenEnvVar: group.primary.bearerTokenEnvVar ?? null,
+          startupTimeoutSec,
+          toolTimeoutSec,
+          disabledTools,
+          isPaused,
+          pausedHarnesses,
+          missingEnvVars,
+          accounts,
+          activeAccountName: activeAccount?.name ?? null,
           primaryHarnessId: group.primaryHarnessId,
           hasDrift: drift.hasDrift,
           driftFields: drift.fields,

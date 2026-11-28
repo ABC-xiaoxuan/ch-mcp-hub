@@ -31,6 +31,7 @@ const FORBIDDEN_PATTERNS = [
 const PACKAGE_ITEMS = [
   "manifest.json",
   "README.md",
+  "CHANGELOG.md",
   "assets",
   "backend",
   "shared",
@@ -72,7 +73,7 @@ async function collectFiles(relPaths) {
     try {
       await walk(rel);
     } catch (error) {
-      if (rel === "README.md" && error?.code === "ENOENT") continue;
+      if ((rel === "README.md" || rel === "CHANGELOG.md") && error?.code === "ENOENT") continue;
       throw error;
     }
   }

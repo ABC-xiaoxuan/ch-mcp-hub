@@ -1,5 +1,5 @@
 /**
- * Shared MCP Hub v1.2 UI controller — Concept C (Modern Bento App Gallery).
+ * Shared MCP Hub v1.3 UI controller — Concept C (Modern Bento App Gallery).
  * Mounted by both `web/index.mjs` (Web left sidebar) and `page/index.mjs`
  * (Desktop Settings plugin page & Web Plugin workspace tab).
  *
@@ -8,10 +8,11 @@
  * - O(1) single-card dock patching (`patchServerMatrixRow`) + `requestAnimationFrame`
  *   batched probe card updates (`scheduleCardPatch`).
  * - Signature Bento expansion (`grid-column: 1 / -1`) when inspecting tools or OAuth 2.1.
+ * - Per-tool granular disable switches + context token savings estimator across 4 harnesses.
+ * - Global pause/resume with harness memory, multi-account credential profiles, timeouts,
+ *   missing `${ENV_VAR}` diagnostics, and live Official MCP Registry + smart URL/package search.
  * - Lazy Backups loading + one-time Presets caching (cuts mutation IPC payloads ~70%).
  * - Zero-I/O 4s revision heartbeat (`overview.poll`) for live CLI config auto-sync.
- * - Interactive MCP Tool Playground (`tools/call`), Redacted Export, Snapshot Preview,
- *   Multi-Select Batch Operations, and keyboard shortcuts (`/`, `N`, `R`, `Esc`).
  */
 
 import { createTranslator, resolveLocale } from "./i18n.mjs";
@@ -26,6 +27,7 @@ const DOCK_LABELS = {
 };
 const TOOLS_INITIAL_LIMIT = 12;
 const SEARCH_DEBOUNCE_MS = 60;
+const REGISTRY_DEBOUNCE_MS = 420;
 const VISIBILITY_REFRESH_MIN_INTERVAL_MS = 2500;
 const LIVE_POLL_INTERVAL_MS = 4000;
 
@@ -61,6 +63,22 @@ function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes < 1024) return `${bytes ?? 0} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatTokens(n) {
+  const num = Math.max(0, Math.round(Number(n) || 0));
+  if (num >= 1000) return `${(num / 1000).toFixed(1)}k`;
+  return String(num);
+}
+
+function estimateToolTokensFallback(tool) {
+  if (Number.isFinite(tool?.estimatedTokens)) return tool.estimatedTokens;
+  const textLen =
+    String(tool?.name ?? "").length +
+    String(tool?.description ?? "").length +
+    (tool?.inputSchema?.fields?.length ?? 0) * 32 +
+    48;
+  return Math.max(12, Math.ceil(textLen / 4));
 }
 
 function formatTime(iso, locale) {
@@ -324,13 +342,23 @@ export function mountMcpHub(container, bridge) {
     toolSearch: new Map(), // serverName -> query string
     toolsExpanded: new Set(),
     oauthFlows: new Map(),
+    registry: {
+      loading: false,
+      query: "",
+      items: [],
+      smartMatch: null,
+      offline: false,
+      searched: false,
+    },
     drawer: null, // { mode: 'editor' | 'tool', ... }
-    modal: null, // { type: 'sync' | 'delete' | 'import' | 'export' | 'confirm' | 'backup-preview' | 'batch-sync', ... }
+    modal: null, // { type: 'sync' | 'delete' | 'import' | 'export' | 'confirm' | 'backup-preview' | 'batch-sync' | 'accounts', ... }
     toast: null,
   };
 
   let toastTimer = null;
   let searchDebounceTimer = null;
+  let registryDebounceTimer = null;
+  let registryReqSeq = 0;
   let livePollTimer = null;
   let isComposingSearch = false;
   let lastRefreshAt = 0;
@@ -705,6 +733,64 @@ export function mountMcpHub(container, bridge) {
     }
   };
 
+  const runRegistrySearch = async (rawQuery) => {
+    const q = String(rawQuery ?? "").trim();
+    const seq = ++registryReqSeq;
+    state.registry = {
+      ...state.registry,
+      loading: true,
+      query: q,
+      offline: false,
+    };
+    if (state.activeTab === "presets") renderContent();
+    try {
+      const res = await invoke("registry.search", { query: q, limit: 20 });
+      if (disposed || signal.aborted || seq !== registryReqSeq) return;
+      state.registry = {
+        loading: false,
+        query: q,
+        items: Array.isArray(res?.items) ? res.items : [],
+        smartMatch: res?.smartMatch ?? null,
+        offline: Boolean(res?.offline),
+        searched: true,
+      };
+      if (state.activeTab === "presets") renderContent();
+    } catch {
+      if (disposed || signal.aborted || seq !== registryReqSeq) return;
+      state.registry = {
+        ...state.registry,
+        loading: false,
+        offline: true,
+        searched: true,
+      };
+      if (state.activeTab === "presets") renderContent();
+    }
+  };
+
+  const scheduleRegistrySearch = () => {
+    if (registryDebounceTimer) {
+      clearTimeout(registryDebounceTimer);
+      registryDebounceTimer = null;
+    }
+    if (state.activeTab !== "presets") return;
+    const q = state.search.trim();
+    if (!q) {
+      if (state.registry.smartMatch) {
+        state.registry = { ...state.registry, smartMatch: null };
+        renderContent();
+      }
+      return;
+    }
+    const looksDirect = /^https?:\/\//iu.test(q) || q.startsWith("@") || q.includes("/");
+    if (!looksDirect && q.length < 2) return;
+    registryDebounceTimer = setTimeout(() => {
+      registryDebounceTimer = null;
+      if (!disposed && state.activeTab === "presets") {
+        runRegistrySearch(state.search.trim());
+      }
+    }, REGISTRY_DEBOUNCE_MS);
+  };
+
   // -------------------------------------------------------------------------
   // Filtering Helpers
   // -------------------------------------------------------------------------
@@ -744,6 +830,21 @@ export function mountMcpHub(container, bridge) {
       const k = row.k.trim();
       if (k) kvObj[k] = row.v;
     }
+    const parseTimeout = (raw) => {
+      const trimmed = String(raw ?? "").trim();
+      if (!trimmed) return null;
+      const num = Number(trimmed);
+      return Number.isFinite(num) && num > 0 ? Math.min(3600, Math.round(num)) : null;
+    };
+    const startupTimeoutSec = parseTimeout(d.startupTimeoutSec);
+    const toolTimeoutSec = parseTimeout(d.toolTimeoutSec);
+    const timeoutPatch = {
+      ...(startupTimeoutSec !== null || d.isEdit ? { startupTimeoutSec } : {}),
+      ...(toolTimeoutSec !== null || d.isEdit ? { toolTimeoutSec } : {}),
+      ...(Array.isArray(d.disabledTools) && d.disabledTools.length > 0
+        ? { disabledTools: d.disabledTools }
+        : {}),
+    };
     if (d.transport === "http" || d.transport === "sse") {
       const bearer = d.bearerTokenEnvVar.trim();
       return {
@@ -753,6 +854,7 @@ export function mountMcpHub(container, bridge) {
         headers: kvObj,
         ...(bearer ? { bearerTokenEnvVar: bearer } : {}),
         enabled: d.enabled,
+        ...timeoutPatch,
       };
     }
     return {
@@ -765,6 +867,7 @@ export function mountMcpHub(container, bridge) {
         .filter(Boolean),
       env: kvObj,
       enabled: d.enabled,
+      ...timeoutPatch,
     };
   };
 
@@ -813,6 +916,15 @@ export function mountMcpHub(container, bridge) {
     d.command = inst.command ?? "npx";
     d.argsText = Array.isArray(inst.args) ? inst.args.join("\n") : "";
     d.bearerTokenEnvVar = inst.bearerTokenEnvVar ?? "";
+    d.startupTimeoutSec =
+      inst.startupTimeoutSec !== undefined && inst.startupTimeoutSec !== null
+        ? String(inst.startupTimeoutSec)
+        : "";
+    d.toolTimeoutSec =
+      inst.toolTimeoutSec !== undefined && inst.toolTimeoutSec !== null
+        ? String(inst.toolTimeoutSec)
+        : "";
+    d.disabledTools = Array.isArray(inst.disabledTools) ? [...inst.disabledTools] : [];
     d.enabled = inst.enabled !== false;
     d.kv =
       kvEntries.length > 0
@@ -831,7 +943,15 @@ export function mountMcpHub(container, bridge) {
       : null;
 
     const base = editServer
-      ? { ...editServer.instances[sourceHarnessId], name: editServer.name }
+      ? {
+          ...editServer.instances[sourceHarnessId],
+          name: editServer.name,
+          startupTimeoutSec:
+            editServer.instances[sourceHarnessId]?.startupTimeoutSec ?? editServer.startupTimeoutSec ?? null,
+          toolTimeoutSec:
+            editServer.instances[sourceHarnessId]?.toolTimeoutSec ?? editServer.toolTimeoutSec ?? null,
+          disabledTools: editServer.disabledTools ?? [],
+        }
       : prefill ?? {
           name: "",
           transport: "http",
@@ -841,6 +961,9 @@ export function mountMcpHub(container, bridge) {
           headers: {},
           env: {},
           bearerTokenEnvVar: "",
+          startupTimeoutSec: null,
+          toolTimeoutSec: null,
+          disabledTools: [],
           enabled: true,
         };
 
@@ -865,6 +988,9 @@ export function mountMcpHub(container, bridge) {
       argsText: "",
       quickCmd: "",
       bearerTokenEnvVar: "",
+      startupTimeoutSec: "",
+      toolTimeoutSec: "",
+      disabledTools: [],
       enabled: true,
       kv: [{ k: "", v: "", reveal: false }],
       targets,
@@ -929,6 +1055,24 @@ export function mountMcpHub(container, bridge) {
       type: "delete",
       server,
       targets: new Set(Object.keys(server.instances)),
+    };
+    renderModal();
+  };
+
+  const openAccountsModal = (server) => {
+    const primary = server.instances[server.primaryHarnessId] ?? server;
+    const isRemote = primary.transport === "http" || primary.transport === "sse";
+    const entries = Object.entries(isRemote ? (primary.headers ?? {}) : (primary.env ?? {}));
+    state.modal = {
+      type: "accounts",
+      serverName: server.name,
+      isRemote,
+      newName: "",
+      kv:
+        entries.length > 0
+          ? entries.map(([k, v]) => ({ k, v, reveal: false }))
+          : [{ k: isRemote ? "Authorization" : "", v: "", reveal: false }],
+      formError: null,
     };
     renderModal();
   };
@@ -1240,6 +1384,8 @@ export function mountMcpHub(container, bridge) {
   };
 
   const renderToolsGridHtml = (serverName, tools) => {
+    const server = findServer(serverName);
+    const disabledSet = new Set(server?.disabledTools ?? []);
     const q = (state.toolSearch.get(serverName) ?? "").trim().toLowerCase();
     const filtered = q
       ? tools.filter(
@@ -1260,24 +1406,43 @@ export function mountMcpHub(container, bridge) {
     return `
       <div class="mh-tools-grid">
         ${visible
-          .map(
-            (tool) => `
-              <button
-                type="button"
-                class="mh-tool-item"
-                data-action="open-tool"
-                data-server="${escapeHtml(serverName)}"
-                data-tool="${escapeHtml(tool.name)}"
-                title="${escapeHtml(t("toolClickHint"))}"
-              >
-                <div class="mh-tool-item-head">
-                  <span class="mh-tool-name">${escapeHtml(tool.name)}</span>
-                  <span class="mh-tool-run-hint">${iconSvg("play", 11)}</span>
+          .map((tool) => {
+            const isDisabled = disabledSet.has(tool.name);
+            const tok = estimateToolTokensFallback(tool);
+            return `
+              <div class="mh-tool-item${isDisabled ? " is-tool-disabled" : ""}" data-tool="${escapeHtml(tool.name)}">
+                <button
+                  type="button"
+                  class="mh-tool-open"
+                  data-action="open-tool"
+                  data-server="${escapeHtml(serverName)}"
+                  data-tool="${escapeHtml(tool.name)}"
+                  title="${escapeHtml(t("toolClickHint"))}"
+                >
+                  <div class="mh-tool-item-head">
+                    <span class="mh-tool-name">${escapeHtml(tool.name)}</span>
+                    <span class="mh-tool-tok">~${escapeHtml(formatTokens(tok))}</span>
+                    <span class="mh-tool-run-hint">${iconSvg("play", 11)}</span>
+                  </div>
+                  ${tool.description ? `<span class="mh-tool-desc">${escapeHtml(tool.description)}</span>` : ""}
+                </button>
+                <div class="mh-tool-switch-wrap">
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked="${isDisabled ? "false" : "true"}"
+                    aria-label="${escapeHtml(`${tool.name}: ${t("toolToggleHint")}`)}"
+                    title="${escapeHtml(t("toolToggleHint"))}"
+                    class="mh-tool-switch${isDisabled ? "" : " is-on"}"
+                    data-action="toggle-tool"
+                    data-server="${escapeHtml(serverName)}"
+                    data-tool="${escapeHtml(tool.name)}"
+                    data-next-enabled="${isDisabled ? "true" : "false"}"
+                  ></button>
                 </div>
-                ${tool.description ? `<span class="mh-tool-desc">${escapeHtml(tool.description)}</span>` : ""}
-              </button>
-            `,
-          )
+              </div>
+            `;
+          })
           .join("")}
       </div>
       ${
@@ -1289,6 +1454,41 @@ export function mountMcpHub(container, bridge) {
               </button>
             </div>
           `
+          : ""
+      }
+    `;
+  };
+
+  const renderToolsBudgetBarLeftHtml = (server, tools) => {
+    const disabledSet = new Set(server.disabledTools ?? []);
+    let totalTokens = 0;
+    let savedTokens = 0;
+    let disabledCount = 0;
+    for (const tool of tools) {
+      const tok = estimateToolTokensFallback(tool);
+      totalTokens += tok;
+      if (disabledSet.has(tool.name)) {
+        disabledCount += 1;
+        savedTokens += tok;
+      }
+    }
+    const enabledCount = Math.max(0, tools.length - disabledCount);
+    return `
+      <div class="mh-label">${escapeHtml(t("probeToolsHeading", { count: tools.length }))}</div>
+      <span class="mh-badge${disabledCount > 0 ? " mh-badge--ok" : ""}">
+        ${escapeHtml(
+          disabledCount > 0
+            ? t("toolsBudgetSaved", {
+                enabled: enabledCount,
+                total: tools.length,
+                saved: formatTokens(savedTokens),
+              })
+            : t("toolsBudgetFull", { tokens: formatTokens(totalTokens) }),
+        )}
+      </span>
+      ${
+        disabledCount > 0
+          ? `<button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="enable-all-tools" data-name="${escapeHtml(server.name)}">${escapeHtml(t("toolsEnableAll"))}</button>`
           : ""
       }
     `;
@@ -1354,7 +1554,7 @@ export function mountMcpHub(container, bridge) {
             tools.length > 0
               ? `
                 <div class="mh-tools-bar">
-                  <div class="mh-label">${escapeHtml(t("probeToolsHeading", { count: tools.length }))}</div>
+                  <div class="mh-tools-bar-left" data-tools-budget-slot>${renderToolsBudgetBarLeftHtml(server, tools)}</div>
                   ${
                     tools.length > 6
                       ? `<input class="mh-input" type="search" data-tool-search="${escapeHtml(server.name)}" value="${escapeHtml(toolQuery)}" placeholder="${escapeHtml(t("probeToolsSearch"))}" />`
@@ -1462,6 +1662,66 @@ export function mountMcpHub(container, bridge) {
     return `<div class="mh-probe-panel">${body}</div>`;
   };
 
+  const isServerPausedOrDisabled = (server) => {
+    const instList = Object.values(server.instances ?? {});
+    const allDisabled = instList.length > 0 && instList.every((inst) => inst.enabled === false);
+    return Boolean(server.isPaused) || allDisabled;
+  };
+
+  const renderDriftBadgeHtml = (server) =>
+    server.hasDrift
+      ? `<button type="button" class="mh-badge mh-badge--warn mh-badge--btn" data-action="open-sync" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("driftClickHint"))}">${escapeHtml(t("driftBadge"))}</button>`
+      : "";
+
+  const renderMissingEnvBadgeHtml = (server) => {
+    const vars = Array.isArray(server.missingEnvVars) ? server.missingEnvVars : [];
+    if (vars.length === 0) return "";
+    const label =
+      vars.length === 1
+        ? t("missingEnvSingle", { var: vars[0] })
+        : t("missingEnvMulti", { count: vars.length });
+    const tip = t("missingEnvHint", { vars: vars.join(", ") });
+    return `<button type="button" class="mh-badge mh-badge--warn mh-badge--btn" data-action="open-edit" data-name="${escapeHtml(server.name)}" title="${escapeHtml(tip)}">${iconSvg("warning", 11)}${escapeHtml(label)}</button>`;
+  };
+
+  const renderCardMetaTagsHtml = (server) => {
+    const isRemote = server.transport === "http" || server.transport === "sse";
+    const checked = state.selectedServers.has(server.name);
+    const disabledCount = server.disabledTools?.length ?? 0;
+    return `
+      <input type="checkbox" class="mh-card-check" data-select-server="${escapeHtml(server.name)}" aria-label="${escapeHtml(server.name)}" ${checked ? "checked" : ""} />
+      <span class="mh-micro-tag">${iconSvg(isRemote ? "globe" : "terminal", 11)}${escapeHtml(server.transport)}</span>
+      ${
+        server.activeAccountName
+          ? `<button type="button" class="mh-account-chip" data-action="open-accounts" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("accountsBtn"))}">${iconSvg("user", 11)}<span>${escapeHtml(server.activeAccountName)}</span></button>`
+          : ""
+      }
+      ${
+        disabledCount > 0
+          ? `<span class="mh-micro-tag" title="${escapeHtml(t("toolToggleHint"))}">${escapeHtml(t("toolsDisabledBadge", { count: disabledCount }))}</span>`
+          : server.secretCount > 0 && (server.hasDrift || state.probes.get(server.name)?.data?.status)
+            ? `<span class="mh-micro-tag" title="${escapeHtml(t("secretBadgeHint"))}">${iconSvg("shield", 11)}${server.secretCount}</span>`
+            : ""
+      }
+    `;
+  };
+
+  const renderPauseButtonHtml = (server) => {
+    const paused = isServerPausedOrDisabled(server);
+    const label = t(paused ? "resumeServer" : "pauseServer");
+    return `
+      <button
+        type="button"
+        class="mh-icon-btn${paused ? " is-resume" : ""}"
+        data-action="toggle-pause"
+        data-name="${escapeHtml(server.name)}"
+        data-next-paused="${paused ? "false" : "true"}"
+        title="${escapeHtml(label)}"
+        aria-label="${escapeHtml(label)}"
+      >${iconSvg(paused ? "play" : "pause", 14)}</button>
+    `;
+  };
+
   const patchServerCard = (serverName) => {
     if (state.activeTab !== "servers") return;
     const card = findCardEl(serverName);
@@ -1470,12 +1730,15 @@ export function mountMcpHub(container, bridge) {
 
     const expanded = state.expandedProbe.has(serverName);
     card.classList.toggle("is-expanded", expanded);
+    card.classList.toggle("is-paused", isServerPausedOrDisabled(server));
 
     const { dotCls, badgeHtml, ctaHtml } = renderCardStatusMeta(server);
     const dotEl = card.querySelector("[data-health-dot]");
     if (dotEl) dotEl.className = `mh-health-dot${dotCls}`;
     const badgeSlot = card.querySelector("[data-probe-badge-slot]");
     if (badgeSlot) badgeSlot.innerHTML = badgeHtml;
+    const metaSlot = card.querySelector("[data-meta-slot]");
+    if (metaSlot) metaSlot.innerHTML = renderCardMetaTagsHtml(server);
     const ctaSlot = card.querySelector("[data-card-cta-slot]");
     if (ctaSlot) ctaSlot.innerHTML = ctaHtml;
     const probeSlot = card.querySelector("[data-probe-slot]");
@@ -1484,18 +1747,20 @@ export function mountMcpHub(container, bridge) {
 
   const patchServerToolsOnly = (serverName) => {
     const card = findCardEl(serverName);
-    if (!card) return;
+    const server = findServer(serverName);
+    if (!card || !server) return;
     const toolsSlot = card.querySelector(".mh-tools-slot");
+    const budgetSlot = card.querySelector("[data-tools-budget-slot]");
     const tools = state.probes.get(serverName)?.data?.tools;
+    if (budgetSlot && Array.isArray(tools)) {
+      budgetSlot.innerHTML = renderToolsBudgetBarLeftHtml(server, tools);
+    }
     if (toolsSlot && Array.isArray(tools)) {
       toolsSlot.innerHTML = renderToolsGridHtml(serverName, tools);
     }
+    const metaSlot = card.querySelector("[data-meta-slot]");
+    if (metaSlot) metaSlot.innerHTML = renderCardMetaTagsHtml(server);
   };
-
-  const renderDriftBadgeHtml = (server) =>
-    server.hasDrift
-      ? `<button type="button" class="mh-badge mh-badge--warn mh-badge--btn" data-action="open-sync" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("driftClickHint"))}">${escapeHtml(t("driftBadge"))}</button>`
-      : "";
 
   const renderMatrixPillsHtml = (server, harnessMap) =>
     HARNESS_ORDER.map((hid) => {
@@ -1538,13 +1803,25 @@ export function mountMcpHub(container, bridge) {
     const harnessMap = Object.fromEntries(harnesses.map((h) => [h.id, h]));
     const matrixSlot = card.querySelector("[data-matrix-slot]");
     const driftSlot = card.querySelector("[data-drift-slot]");
+    const envSlot = card.querySelector("[data-env-slot]");
     const badgeSlot = card.querySelector("[data-probe-badge-slot]");
+    const metaSlot = card.querySelector("[data-meta-slot]");
+    const pauseSlot = card.querySelector("[data-pause-slot]");
     if (!matrixSlot) return false;
+    card.classList.toggle("is-paused", isServerPausedOrDisabled(server));
     matrixSlot.innerHTML = renderMatrixPillsHtml(server, harnessMap);
     if (driftSlot) driftSlot.innerHTML = renderDriftBadgeHtml(server);
+    if (envSlot) envSlot.innerHTML = renderMissingEnvBadgeHtml(server);
     if (badgeSlot) {
       const { badgeHtml } = renderCardStatusMeta(server);
       badgeSlot.innerHTML = badgeHtml;
+    }
+    if (metaSlot) metaSlot.innerHTML = renderCardMetaTagsHtml(server);
+    if (pauseSlot) pauseSlot.innerHTML = renderPauseButtonHtml(server);
+    const accBtn = card.querySelector('[data-action="open-accounts"]');
+    if (accBtn) accBtn.classList.toggle("is-active", (server.accounts?.length ?? 0) > 0);
+    if (state.expandedProbe.has(serverName)) {
+      patchServerToolsOnly(serverName);
     }
     return true;
   };
@@ -1612,9 +1889,10 @@ export function mountMcpHub(container, bridge) {
             const { dotCls, badgeHtml, ctaHtml } = renderCardStatusMeta(server);
             const checked = state.selectedServers.has(server.name);
             const expanded = state.expandedProbe.has(server.name);
+            const paused = isServerPausedOrDisabled(server);
 
             return `
-              <article class="mh-server-card${checked ? " is-checked" : ""}${expanded ? " is-expanded" : ""}" data-server="${escapeHtml(server.name)}">
+              <article class="mh-server-card${checked ? " is-checked" : ""}${expanded ? " is-expanded" : ""}${paused ? " is-paused" : ""}" data-server="${escapeHtml(server.name)}">
                 <div class="mh-bento-top">
                   <div class="mh-bento-id">
                     <div class="mh-squircle mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
@@ -1628,6 +1906,7 @@ export function mountMcpHub(container, bridge) {
                   </div>
                   <div class="mh-bento-badges">
                     <span data-drift-slot>${renderDriftBadgeHtml(server)}</span>
+                    <span data-env-slot>${renderMissingEnvBadgeHtml(server)}</span>
                     <span data-probe-badge-slot>${badgeHtml}</span>
                   </div>
                 </div>
@@ -1639,16 +1918,14 @@ export function mountMcpHub(container, bridge) {
                     ${renderMatrixPillsHtml(server, harnessMap)}
                   </div>
                   <div class="mh-card-foot">
-                    <div class="mh-card-meta-tags">
-                      <input type="checkbox" class="mh-card-check" data-select-server="${escapeHtml(server.name)}" aria-label="${escapeHtml(server.name)}" ${checked ? "checked" : ""} />
-                      <span class="mh-micro-tag">${iconSvg(isRemote ? "globe" : "terminal", 11)}${escapeHtml(server.transport)}</span>
-                      ${
-                        server.secretCount > 0 && (server.hasDrift || state.probes.get(server.name)?.data?.status)
-                          ? `<span class="mh-micro-tag" title="${escapeHtml(t("secretBadgeHint"))}">${iconSvg("shield", 11)}${server.secretCount}</span>`
-                          : ""
-                      }
+                    <div class="mh-card-meta-tags" data-meta-slot>
+                      ${renderCardMetaTagsHtml(server)}
                     </div>
                     <div class="mh-card-actions">
+                      <span data-pause-slot>${renderPauseButtonHtml(server)}</span>
+                      <button type="button" class="mh-icon-btn${(server.accounts?.length ?? 0) > 0 ? " is-active" : ""}" data-action="open-accounts" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("accountsBtn"))}" aria-label="${escapeHtml(t("accountsBtn"))}">
+                        ${iconSvg("user", 14)}
+                      </button>
                       <button type="button" class="mh-icon-btn" data-action="open-sync" data-name="${escapeHtml(server.name)}" title="${escapeHtml(t("sync"))}" aria-label="${escapeHtml(t("sync"))}">
                         ${iconSvg("sync", 14)}
                       </button>
@@ -1801,57 +2078,156 @@ export function mountMcpHub(container, bridge) {
     const presets = filteredPresets();
     const configured = new Set((state.overview?.servers ?? []).map((s) => s.name));
     const lang = resolveLocale(bridge.getLocale());
+    const reg = state.registry;
+    const smart = reg.smartMatch;
 
-    if (presets.length === 0) {
-      return `
-        <div class="mh-empty">
-          ${iconSvg("search", 24)}
-          <h3>${escapeHtml(t("noMatchTitle"))}</h3>
-          <p>${escapeHtml(t("noMatchHint"))}</p>
+    const smartBannerHtml = smart
+      ? (() => {
+          const isRemote = smart.transport === "http" || smart.transport === "sse";
+          const targetPreview = isRemote
+            ? smart.url
+            : [smart.command, ...(smart.args ?? [])].join(" ");
+          const desc = smart.description?.[lang] ?? smart.description?.en ?? targetPreview;
+          const visual = getMonogramVisual(smart.id);
+          return `
+            <div class="mh-smart-banner">
+              <div class="mh-bento-id">
+                <div class="mh-squircle mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
+                <div class="mh-bento-titles">
+                  <div class="mh-bento-name-row">
+                    <span class="mh-badge mh-badge--http">${escapeHtml(t("smartMatchBadge"))}</span>
+                    <h3 class="mh-bento-name">${escapeHtml(smart.name)}</h3>
+                  </div>
+                  <div class="mh-bento-host" title="${escapeHtml(targetPreview)}">${escapeHtml(desc)}</div>
+                </div>
+              </div>
+              <button type="button" class="mh-btn mh-btn--primary mh-btn--sm" data-action="use-registry-item" data-reg-idx="smart">
+                ${iconSvg("plus", 13)}<span>${escapeHtml(t("usePreset"))}</span>
+              </button>
+            </div>
+          `;
+        })()
+      : "";
+
+    const curatedHtml =
+      presets.length > 0
+        ? `
+          <div class="mh-bento-grid">
+            ${presets
+              .map((preset) => {
+                const isRemote = preset.transport === "http" || preset.transport === "sse";
+                const desc = preset.description?.[lang] ?? preset.description?.en ?? "";
+                const isInstalled = configured.has(preset.id);
+                const targetPreview = isRemote
+                  ? preset.url
+                  : [preset.command, ...(preset.args ?? [])].join(" ");
+                const hostShort = compactHostSummary(preset);
+                const visual = getMonogramVisual(preset.id);
+
+                return `
+                  <article class="mh-preset-card">
+                    <div class="mh-bento-top">
+                      <div class="mh-bento-id">
+                        <div class="mh-squircle mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
+                        <div class="mh-bento-titles">
+                          <h3 class="mh-bento-name">${escapeHtml(preset.name)}</h3>
+                          <div class="mh-bento-host" data-action="copy-text" data-text="${escapeHtml(targetPreview)}" title="${escapeHtml(targetPreview)}">${escapeHtml(hostShort)}</div>
+                        </div>
+                      </div>
+                      <div class="mh-bento-badges">
+                        ${preset.oauthHint ? `<span class="mh-badge mh-badge--warn">${escapeHtml(t("oauthBadge"))}</span>` : ""}
+                        ${isInstalled ? `<span class="mh-badge mh-badge--ok">${escapeHtml(t("installedBadge"))}</span>` : ""}
+                      </div>
+                    </div>
+                    <p class="mh-bento-desc">${escapeHtml(desc)}</p>
+                    <div class="mh-preset-footer">
+                      <span class="mh-micro-tag">${iconSvg(isRemote ? "globe" : "terminal", 11)}${escapeHtml(preset.transport)}</span>
+                      <button type="button" class="mh-btn mh-btn--sm${isInstalled ? "" : " mh-btn--primary"}" data-action="use-preset" data-preset="${escapeHtml(preset.id)}">
+                        ${iconSvg("plus", 13)}<span>${escapeHtml(t("usePreset"))}</span>
+                      </button>
+                    </div>
+                  </article>
+                `;
+              })
+              .join("")}
+          </div>
+        `
+        : !smart && reg.items.length === 0 && !reg.loading
+          ? `
+            <div class="mh-empty">
+              ${iconSvg("search", 24)}
+              <h3>${escapeHtml(t("noMatchTitle"))}</h3>
+              <p>${escapeHtml(t("noMatchHint"))}</p>
+            </div>
+          `
+          : "";
+
+    let registryBodyHtml = "";
+    if (reg.loading) {
+      registryBodyHtml = `<div class="mh-empty"><div class="mh-probe-status mh-spin">${iconSvg("cloud", 18)}<span>${escapeHtml(t("registrySearching"))}</span></div></div>`;
+    } else if (reg.offline) {
+      registryBodyHtml = `<p class="mh-hint">${escapeHtml(t("registryOfflineHint"))}</p>`;
+    } else if (reg.items.length > 0) {
+      registryBodyHtml = `
+        <div class="mh-bento-grid">
+          ${reg.items
+            .map((item, idx) => {
+              const isRemote = item.transport === "http" || item.transport === "sse";
+              const desc = item.description?.[lang] ?? item.description?.en ?? "";
+              const isInstalled = configured.has(item.id);
+              const targetPreview = isRemote
+                ? item.url
+                : [item.command, ...(item.args ?? [])].join(" ");
+              const hostShort = compactHostSummary(item);
+              const visual = getMonogramVisual(item.id);
+              return `
+                <article class="mh-preset-card">
+                  <div class="mh-bento-top">
+                    <div class="mh-bento-id">
+                      <div class="mh-squircle mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
+                      <div class="mh-bento-titles">
+                        <h3 class="mh-bento-name">${escapeHtml(item.name)}</h3>
+                        <div class="mh-bento-host" data-action="copy-text" data-text="${escapeHtml(targetPreview)}" title="${escapeHtml(targetPreview)}">${escapeHtml(hostShort)}</div>
+                      </div>
+                    </div>
+                    <div class="mh-bento-badges">
+                      <span class="mh-badge mh-badge--http">${escapeHtml(t("registryBadge"))}</span>
+                      ${isInstalled ? `<span class="mh-badge mh-badge--ok">${escapeHtml(t("installedBadge"))}</span>` : ""}
+                    </div>
+                  </div>
+                  <p class="mh-bento-desc">${escapeHtml(desc)}</p>
+                  <div class="mh-preset-footer">
+                    <span class="mh-micro-tag">${iconSvg(isRemote ? "globe" : "terminal", 11)}${escapeHtml(item.transport)}${item.version ? ` · v${escapeHtml(item.version)}` : ""}</span>
+                    <button type="button" class="mh-btn mh-btn--sm${isInstalled ? "" : " mh-btn--primary"}" data-action="use-registry-item" data-reg-idx="${idx}">
+                      ${iconSvg("plus", 13)}<span>${escapeHtml(t("usePreset"))}</span>
+                    </button>
+                  </div>
+                </article>
+              `;
+            })
+            .join("")}
         </div>
       `;
+    } else if (reg.searched) {
+      registryBodyHtml = `<p class="mh-hint">${escapeHtml(t("noMatchTitle"))} · ${escapeHtml(t("noMatchHint"))}</p>`;
+    } else {
+      registryBodyHtml = `<p class="mh-hint">${escapeHtml(t("registryEmptyHint"))}</p>`;
     }
 
     return `
-      <div class="mh-bento-grid">
-        ${presets
-          .map((preset) => {
-            const isRemote = preset.transport === "http" || preset.transport === "sse";
-            const desc = preset.description?.[lang] ?? preset.description?.en ?? "";
-            const isInstalled = configured.has(preset.id);
-            const targetPreview = isRemote
-              ? preset.url
-              : [preset.command, ...(preset.args ?? [])].join(" ");
-            const hostShort = compactHostSummary(preset);
-            const visual = getMonogramVisual(preset.id);
-
-            return `
-              <article class="mh-preset-card">
-                <div class="mh-bento-top">
-                  <div class="mh-bento-id">
-                    <div class="mh-squircle mh-sq--${escapeHtml(visual.tone)}" aria-hidden="true">${escapeHtml(visual.monogram)}</div>
-                    <div class="mh-bento-titles">
-                      <h3 class="mh-bento-name">${escapeHtml(preset.name)}</h3>
-                      <div class="mh-bento-host" data-action="copy-text" data-text="${escapeHtml(targetPreview)}" title="${escapeHtml(targetPreview)}">${escapeHtml(hostShort)}</div>
-                    </div>
-                  </div>
-                  <div class="mh-bento-badges">
-                    ${preset.oauthHint ? `<span class="mh-badge mh-badge--warn">${escapeHtml(t("oauthBadge"))}</span>` : ""}
-                    ${isInstalled ? `<span class="mh-badge mh-badge--ok">${escapeHtml(t("installedBadge"))}</span>` : ""}
-                  </div>
-                </div>
-                <p class="mh-bento-desc">${escapeHtml(desc)}</p>
-                <div class="mh-preset-footer">
-                  <span class="mh-micro-tag">${iconSvg(isRemote ? "globe" : "terminal", 11)}${escapeHtml(preset.transport)}</span>
-                  <button type="button" class="mh-btn mh-btn--sm${isInstalled ? "" : " mh-btn--primary"}" data-action="use-preset" data-preset="${escapeHtml(preset.id)}">
-                    ${iconSvg("plus", 13)}<span>${escapeHtml(t("usePreset"))}</span>
-                  </button>
-                </div>
-              </article>
-            `;
-          })
-          .join("")}
-      </div>
+      ${smartBannerHtml}
+      ${curatedHtml}
+      <section class="mh-registry-section">
+        <div class="mh-registry-head">
+          <h2 class="mh-section-title" style="display:inline-flex;align-items:center;gap:7px">
+            ${iconSvg("cloud", 16)}<span>${escapeHtml(t("registrySectionTitle"))}</span>
+          </h2>
+          <button type="button" class="mh-btn mh-btn--sm${reg.loading ? " mh-spin" : ""}" data-action="registry-search" ${reg.loading ? "disabled" : ""}>
+            ${iconSvg("cloud", 13)}<span>${escapeHtml(reg.loading ? t("registrySearching") : t("registrySearchBtn"))}</span>
+          </button>
+        </div>
+        ${registryBodyHtml}
+      </section>
     `;
   };
 
@@ -2153,6 +2529,19 @@ export function mountMcpHub(container, bridge) {
                 `,
               )
               .join("")}
+          </div>
+        </div>
+        <div class="mh-field">
+          <span class="mh-label">${escapeHtml(t("timeoutSectionTitle"))}</span>
+          <div class="mh-timeout-grid">
+            <div class="mh-field">
+              <label class="mh-hint" for="mh-f-startup-to">${escapeHtml(t("fieldStartupTimeout"))}</label>
+              <input id="mh-f-startup-to" class="mh-input" type="number" min="1" max="3600" inputmode="numeric" data-drawer-field="startupTimeoutSec" value="${escapeHtml(d.startupTimeoutSec)}" placeholder="30" />
+            </div>
+            <div class="mh-field">
+              <label class="mh-hint" for="mh-f-tool-to">${escapeHtml(t("fieldToolTimeout"))}</label>
+              <input id="mh-f-tool-to" class="mh-input" type="number" min="1" max="3600" inputmode="numeric" data-drawer-field="toolTimeoutSec" value="${escapeHtml(d.toolTimeoutSec)}" placeholder="60" />
+            </div>
           </div>
         </div>
         <div class="mh-field">
@@ -2520,6 +2909,98 @@ export function mountMcpHub(container, bridge) {
       return;
     }
 
+    if (m.type === "accounts") {
+      const server = findServer(m.serverName);
+      if (!server) {
+        slots.modal.innerHTML = "";
+        return;
+      }
+      const accounts = Array.isArray(server.accounts) ? server.accounts : [];
+      slots.modal.innerHTML = `
+        <div class="mh-backdrop" data-action="close-modal-backdrop">
+          <div class="mh-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(t("modalAccountsTitle", { name: server.name }))}">
+            <div class="mh-modal-head">
+              <h2 class="mh-modal-title">${escapeHtml(t("modalAccountsTitle", { name: server.name }))}</h2>
+              <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="close-modal" aria-label="${escapeHtml(t("close"))}">${iconSvg("close", 15)}</button>
+            </div>
+            <div class="mh-modal-body">
+              <p class="mh-hint">${escapeHtml(t("modalAccountsHint"))}</p>
+              ${
+                accounts.length === 0
+                  ? `<p class="mh-hint">${escapeHtml(t("accountsEmpty"))}</p>`
+                  : `
+                    <div class="mh-account-list">
+                      ${accounts
+                        .map((acc) => {
+                          const keys = m.isRemote ? acc.headerKeys ?? [] : acc.envKeys ?? [];
+                          return `
+                            <div class="mh-account-row${acc.active ? " is-active" : ""}">
+                              <div class="mh-backup-info">
+                                <div class="mh-backup-title">
+                                  ${iconSvg("user", 14)}
+                                  <span>${escapeHtml(acc.name)}</span>
+                                  ${acc.active ? `<span class="mh-badge mh-badge--ok">${escapeHtml(t("accountActive"))}</span>` : ""}
+                                </div>
+                                <div class="mh-backup-sub">${escapeHtml(t("accountKeysCount", { count: keys.length }))}${keys.length ? ` · ${escapeHtml(keys.join(", "))}` : ""}</div>
+                              </div>
+                              <div style="display:inline-flex;align-items:center;gap:6px;flex-shrink:0">
+                                ${
+                                  acc.active
+                                    ? ""
+                                    : `<button type="button" class="mh-btn mh-btn--primary mh-btn--sm" data-action="switch-account" data-account-id="${escapeHtml(acc.id)}" data-account-name="${escapeHtml(acc.name)}" ${state.busy ? "disabled" : ""}>${escapeHtml(t("accountSwitch"))}</button>`
+                                }
+                                <button type="button" class="mh-icon-btn mh-icon-btn--danger" data-action="delete-account" data-account-id="${escapeHtml(acc.id)}" title="${escapeHtml(t("remove"))}" aria-label="${escapeHtml(t("remove"))}" ${state.busy ? "disabled" : ""}>${iconSvg("trash", 14)}</button>
+                              </div>
+                            </div>
+                          `;
+                        })
+                        .join("")}
+                    </div>
+                  `
+              }
+              <div class="mh-account-box">
+                <div class="mh-label">${escapeHtml(t("accountNewTitle"))}</div>
+                ${m.formError ? `<div class="mh-error-banner">${escapeHtml(m.formError)}</div>` : ""}
+                <input class="mh-input" data-modal-field="newName" value="${escapeHtml(m.newName)}" placeholder="${escapeHtml(t("accountNamePlaceholder"))}" />
+                <div class="mh-field">
+                  <div style="display:flex;align-items:center;justify-content:space-between">
+                    <span class="mh-hint">${escapeHtml(t(m.isRemote ? "fieldHeaders" : "fieldEnv"))}</span>
+                    <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="account-kv-add">${iconSvg("plus", 12)}<span>${escapeHtml(t("addRow"))}</span></button>
+                  </div>
+                  <div class="mh-kv-list">
+                    ${m.kv
+                      .map(
+                        (row, idx) => `
+                          <div class="mh-kv-row">
+                            <input class="mh-input" data-acc-kv-key="${idx}" value="${escapeHtml(row.k)}" placeholder="${escapeHtml(t("keyPlaceholder"))}" />
+                            <input class="mh-input" type="${row.reveal ? "text" : "password"}" data-acc-kv-val="${idx}" value="${escapeHtml(row.v)}" placeholder="${escapeHtml(t("valuePlaceholder"))}" />
+                            <div style="display:inline-flex;gap:3px">
+                              <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="account-kv-reveal" data-idx="${idx}" title="${escapeHtml(t("toggleSecret"))}" aria-label="${escapeHtml(t("toggleSecret"))}">${iconSvg("eye", 13)}</button>
+                              <button type="button" class="mh-btn mh-btn--ghost mh-btn--sm" data-action="account-kv-del" data-idx="${idx}" title="${escapeHtml(t("remove"))}" aria-label="${escapeHtml(t("remove"))}">${iconSvg("close", 13)}</button>
+                            </div>
+                          </div>
+                        `,
+                      )
+                      .join("")}
+                  </div>
+                </div>
+                <div style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap">
+                  <button type="button" class="mh-btn mh-btn--sm" data-action="submit-save-account" data-activate="false" ${state.busy ? "disabled" : ""}>${escapeHtml(t("accountSaveCurrent"))}</button>
+                  <button type="button" class="mh-btn mh-btn--primary mh-btn--sm" data-action="submit-save-account" data-activate="true" ${state.busy ? "disabled" : ""}>${escapeHtml(t("accountSaveAndSwitch"))}</button>
+                </div>
+              </div>
+            </div>
+            <div class="mh-modal-foot">
+              <div class="mh-modal-foot-right">
+                <button type="button" class="mh-btn" data-action="close-modal">${escapeHtml(t("close"))}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+      return;
+    }
+
     if (m.type === "confirm") {
       slots.modal.innerHTML = `
         <div class="mh-backdrop" data-action="close-modal-backdrop">
@@ -2578,6 +3059,7 @@ export function mountMcpHub(container, bridge) {
       state.search = slots.searchInput.value;
       renderSubbar();
       renderContent();
+      scheduleRegistrySearch();
     },
     { signal },
   );
@@ -2585,7 +3067,24 @@ export function mountMcpHub(container, bridge) {
     "input",
     () => {
       state.search = slots.searchInput.value;
-      if (!isComposingSearch) scheduleSearchRender();
+      if (!isComposingSearch) {
+        scheduleSearchRender();
+        scheduleRegistrySearch();
+      }
+    },
+    { signal },
+  );
+  slots.searchInput.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key === "Enter" && state.activeTab === "presets") {
+        event.preventDefault();
+        if (registryDebounceTimer) {
+          clearTimeout(registryDebounceTimer);
+          registryDebounceTimer = null;
+        }
+        runRegistrySearch(state.search.trim());
+      }
     },
     { signal },
   );
@@ -2632,6 +3131,19 @@ export function mountMcpHub(container, bridge) {
         if (target.dataset.kvVal !== undefined) {
           const idx = Number(target.dataset.kvVal);
           if (state.drawer.kv[idx]) state.drawer.kv[idx].v = target.value;
+          return;
+        }
+      }
+
+      if (state.modal?.type === "accounts") {
+        if (target.dataset.accKvKey !== undefined) {
+          const idx = Number(target.dataset.accKvKey);
+          if (state.modal.kv[idx]) state.modal.kv[idx].k = target.value;
+          return;
+        }
+        if (target.dataset.accKvVal !== undefined) {
+          const idx = Number(target.dataset.accKvVal);
+          if (state.modal.kv[idx]) state.modal.kv[idx].v = target.value;
           return;
         }
       }
@@ -2855,6 +3367,8 @@ export function mountMcpHub(container, bridge) {
           renderBatchBar();
           if (nextTab === "backups") {
             ensureBackupsLoaded(false);
+          } else if (nextTab === "presets" && state.search.trim()) {
+            scheduleRegistrySearch();
           }
         }
         return;
@@ -2972,6 +3486,84 @@ export function mountMcpHub(container, bridge) {
       if (action === "open-delete") {
         const server = findServer(el.dataset.name);
         if (server) openDeleteModal(server);
+        return;
+      }
+      if (action === "open-accounts") {
+        const server = findServer(el.dataset.name);
+        if (server) openAccountsModal(server);
+        return;
+      }
+      if (action === "toggle-pause") {
+        const name = el.dataset.name;
+        const nextPaused = el.dataset.nextPaused === "true";
+        el.setAttribute("disabled", "true");
+        const res = await invokeWithOverview(
+          "server.setPaused",
+          { name, paused: nextPaused },
+          null,
+          { lockGlobal: false, patchRow: name },
+        );
+        if (res && !disposed && !signal.aborted) {
+          if (nextPaused) {
+            showToast(t("toastPaused", { name }));
+          } else {
+            const cnt = Array.isArray(res.restoredHarnesses) ? res.restoredHarnesses.length : 0;
+            showToast(t("toastResumed", { name, count: cnt }));
+          }
+        }
+        return;
+      }
+      if (action === "toggle-tool") {
+        const serverName = el.dataset.server;
+        const toolName = el.dataset.tool;
+        const nextEnabled = el.dataset.nextEnabled === "true";
+        const server = findServer(serverName);
+        if (!server || !toolName) return;
+        const nextSet = new Set(server.disabledTools ?? []);
+        if (nextEnabled) nextSet.delete(toolName);
+        else nextSet.add(toolName);
+        const disabledTools = [...nextSet].sort();
+        el.setAttribute("disabled", "true");
+        await invokeWithOverview(
+          "server.setDisabledTools",
+          { name: serverName, disabledTools },
+          t("toastToolsUpdated", { name: serverName, count: disabledTools.length }),
+          { lockGlobal: false, patchRow: serverName },
+        );
+        return;
+      }
+      if (action === "enable-all-tools") {
+        const serverName = el.dataset.name;
+        if (!serverName) return;
+        el.setAttribute("disabled", "true");
+        await invokeWithOverview(
+          "server.setDisabledTools",
+          { name: serverName, disabledTools: [] },
+          t("toastToolsUpdated", { name: serverName, count: 0 }),
+          { lockGlobal: false, patchRow: serverName },
+        );
+        return;
+      }
+      if (action === "registry-search") {
+        await runRegistrySearch(state.search.trim());
+        return;
+      }
+      if (action === "use-registry-item") {
+        const idx = el.dataset.regIdx;
+        const item =
+          idx === "smart" ? state.registry.smartMatch : state.registry.items[Number(idx)];
+        if (item) {
+          openEditorDrawer({
+            name: item.id,
+            transport: item.transport,
+            url: item.url ?? "",
+            command: item.command ?? "npx",
+            args: item.args ?? [],
+            headers: item.headers ?? {},
+            env: item.env ?? {},
+            enabled: true,
+          });
+        }
         return;
       }
       if (action === "open-import") {
@@ -3409,6 +4001,90 @@ export function mountMcpHub(container, bridge) {
           }
           return;
         }
+
+        if (state.modal.type === "accounts") {
+          if (action === "account-kv-add") {
+            state.modal.kv.push({ k: "", v: "", reveal: false });
+            renderModal();
+            return;
+          }
+          if (action === "account-kv-del") {
+            const idx = Number(el.dataset.idx);
+            state.modal.kv.splice(idx, 1);
+            if (state.modal.kv.length === 0) state.modal.kv.push({ k: "", v: "", reveal: false });
+            renderModal();
+            return;
+          }
+          if (action === "account-kv-reveal") {
+            const idx = Number(el.dataset.idx);
+            if (state.modal.kv[idx]) {
+              state.modal.kv[idx].reveal = !state.modal.kv[idx].reveal;
+              renderModal();
+            }
+            return;
+          }
+          if (action === "submit-save-account") {
+            const name = String(state.modal.newName ?? "").trim();
+            if (!name) {
+              state.modal.formError = t("accountNamePlaceholder");
+              renderModal();
+              return;
+            }
+            const kvObj = {};
+            for (const row of state.modal.kv) {
+              const k = row.k.trim();
+              if (k) kvObj[k] = row.v;
+            }
+            const activate = el.dataset.activate === "true";
+            const serverName = state.modal.serverName;
+            state.modal.formError = null;
+            const res = await invokeWithOverview(
+              "server.saveAccount",
+              {
+                serverName,
+                name,
+                ...(state.modal.isRemote ? { headers: kvObj } : { env: kvObj }),
+                activate,
+              },
+              t(activate ? "toastAccountSwitched" : "toastAccountSaved", { name }),
+              { lockGlobal: true, patchRow: serverName },
+            );
+            if (res && !disposed && !signal.aborted && state.modal?.type === "accounts") {
+              state.modal.newName = "";
+              renderModal();
+            }
+            return;
+          }
+          if (action === "switch-account") {
+            const accountId = el.dataset.accountId;
+            const accountName = el.dataset.accountName || accountId;
+            const serverName = state.modal.serverName;
+            const res = await invokeWithOverview(
+              "server.switchAccount",
+              { serverName, accountId },
+              t("toastAccountSwitched", { name: accountName }),
+              { lockGlobal: true, patchRow: serverName },
+            );
+            if (res && !disposed && !signal.aborted && state.modal?.type === "accounts") {
+              renderModal();
+            }
+            return;
+          }
+          if (action === "delete-account") {
+            const accountId = el.dataset.accountId;
+            const serverName = state.modal.serverName;
+            const res = await invokeWithOverview(
+              "server.deleteAccount",
+              { serverName, accountId },
+              t("toastAccountDeleted"),
+              { lockGlobal: true, patchRow: serverName },
+            );
+            if (res && !disposed && !signal.aborted && state.modal?.type === "accounts") {
+              renderModal();
+            }
+            return;
+          }
+        }
       }
 
       if (action === "preview-backup") {
@@ -3472,6 +4148,7 @@ export function mountMcpHub(container, bridge) {
     disposed = true;
     if (toastTimer) clearTimeout(toastTimer);
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    if (registryDebounceTimer) clearTimeout(registryDebounceTimer);
     if (livePollTimer) clearInterval(livePollTimer);
     if (rafId !== null && typeof win?.cancelAnimationFrame === "function") {
       win.cancelAnimationFrame(rafId);

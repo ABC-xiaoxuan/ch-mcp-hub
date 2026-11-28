@@ -9,6 +9,7 @@ import {
   McpConfigStore,
   computeServerDrift,
   countHardcodedSecrets,
+  findMissingEnvVars,
   isHardcodedSecret,
   renderNativePreviews,
 } from "../backend/adapters.mjs";
@@ -21,6 +22,12 @@ import {
   probeAllServers,
   probeMcpServer,
 } from "../backend/probe.mjs";
+import {
+  clearRegistryCache,
+  normalizeRegistryEntry,
+  resolveSmartInput,
+  searchMcpRegistry,
+} from "../backend/registry.mjs";
 import { parseCodexMcpToml, patchCodexMcpToml } from "../backend/toml.mjs";
 import { tokenizeCommandLine } from "../shared/ui.mjs";
 
@@ -401,6 +408,214 @@ describe("Four-harness McpConfigStore & Performance Engine", () => {
     const afterDel = await store.buildOverview({ includeBackups: false });
     assert.equal(afterDel.servers.length, 0);
   });
+
+  it("writes per-tool disabledTools natively across all 4 harnesses, handles global pause/resume, timeouts, env diagnostics & multi-account profiles", async () => {
+    // Seed existing user Claude permissions.deny rule to verify surgical preservation!
+    await mkdir(path.join(homeDir, ".claude"), { recursive: true });
+    await writeFile(
+      path.join(homeDir, ".claude", "settings.json"),
+      JSON.stringify({ permissions: { deny: ["Bash(rm -rf *)"] } }, null, 2),
+      "utf8",
+    );
+
+    await store.upsertServer(
+      {
+        name: "github",
+        transport: "http",
+        url: "https://api.githubcopilot.com/mcp/",
+        headers: { Authorization: "Bearer ${MISSING_GH_PAT_TEST}" },
+        bearerTokenEnvVar: "MISSING_BEARER_VAR_TEST",
+        startupTimeoutSec: 45,
+        toolTimeoutSec: 120,
+        enabled: true,
+      },
+      ["claude-code", "antigravity", "opencode", "codex"],
+    );
+
+    // Verify Codex timeouts & missing env var diagnostics
+    const ov1 = await store.buildOverview({ includeBackups: false });
+    const gh1 = ov1.servers.find((s) => s.name === "github");
+    assert.equal(gh1.startupTimeoutSec, 45);
+    assert.equal(gh1.toolTimeoutSec, 120);
+    assert.deepEqual(gh1.missingEnvVars, ["MISSING_BEARER_VAR_TEST", "MISSING_GH_PAT_TEST"]);
+    assert.deepEqual(
+      findMissingEnvVars(gh1.instances, {
+        MISSING_GH_PAT_TEST: "ok",
+        MISSING_BEARER_VAR_TEST: "ok",
+      }),
+      [],
+    );
+
+    // 1. Per-tool granular disable across all 4 harnesses
+    await store.setDisabledTools("github", ["delete_repo", "create_branch"]);
+
+    const claudeSettings = JSON.parse(await readFile(path.join(homeDir, ".claude", "settings.json"), "utf8"));
+    assert.ok(claudeSettings.permissions.deny.includes("Bash(rm -rf *)"));
+    assert.ok(claudeSettings.permissions.deny.includes("mcp__github__delete_repo"));
+    assert.ok(claudeSettings.permissions.deny.includes("mcp__github__create_branch"));
+
+    const agyRaw = JSON.parse(await readFile(path.join(homeDir, ".gemini", "config", "mcp_config.json"), "utf8"));
+    assert.deepEqual(agyRaw.mcpServers.github.excludeTools, ["create_branch", "delete_repo"]);
+
+    const ocRaw = JSON.parse(await readFile(path.join(homeDir, ".config", "opencode", "opencode.json"), "utf8"));
+    assert.equal(ocRaw.tools.github_delete_repo, false);
+    assert.equal(ocRaw.tools.github_create_branch, false);
+
+    const codexParsed = parseCodexMcpToml(await readFile(path.join(homeDir, ".codex", "config.toml"), "utf8"));
+    assert.deepEqual(codexParsed.servers.github.disabled_tools, ["create_branch", "delete_repo"]);
+    assert.equal(codexParsed.servers.github.startup_timeout_sec, 45);
+    assert.equal(codexParsed.servers.github.tool_timeout_sec, 120);
+
+    // Re-enable one tool and confirm user rule stays intact
+    await store.setDisabledTools("github", ["delete_repo"]);
+    const claudeSettings2 = JSON.parse(await readFile(path.join(homeDir, ".claude", "settings.json"), "utf8"));
+    assert.ok(claudeSettings2.permissions.deny.includes("Bash(rm -rf *)"));
+    assert.ok(claudeSettings2.permissions.deny.includes("mcp__github__delete_repo"));
+    assert.ok(!claudeSettings2.permissions.deny.includes("mcp__github__create_branch"));
+
+    // 2. Global Pause remembers ONLY previously enabled harnesses & Resume restores exact subset
+    await store.toggleServer("github", "opencode", false);
+    await store.toggleServer("github", "antigravity", false);
+    // Now only claude-code & codex are enabled
+    await store.setServerPaused("github", true);
+    const ovPaused = await store.buildOverview({ includeBackups: false });
+    const ghPaused = ovPaused.servers.find((s) => s.name === "github");
+    assert.equal(ghPaused.isPaused, true);
+    assert.equal(ghPaused.instances["claude-code"].enabled, false);
+    assert.equal(ghPaused.instances.codex.enabled, false);
+
+    await store.setServerPaused("github", false);
+    const ovResumed = await store.buildOverview({ includeBackups: false });
+    const ghResumed = ovResumed.servers.find((s) => s.name === "github");
+    assert.equal(ghResumed.isPaused, false);
+    assert.equal(ghResumed.instances["claude-code"].enabled, true);
+    assert.equal(ghResumed.instances.codex.enabled, true);
+    assert.equal(ghResumed.instances.opencode.enabled, false);
+    assert.equal(ghResumed.instances.antigravity.enabled, false);
+
+    // 3. Multi-account credential profiles switch seamlessly across all harnesses
+    const workAcc = await store.saveServerAccount({
+      serverName: "github",
+      name: "Work GitHub",
+      headers: { Authorization: "Bearer ghp_work_account_token_123" },
+      activate: true,
+    });
+    const personalAcc = await store.saveServerAccount({
+      serverName: "github",
+      name: "Personal GitHub",
+      headers: { Authorization: "Bearer ghp_personal_account_token_999" },
+      activate: false,
+    });
+
+    const ovAcc1 = await store.buildOverview({ includeBackups: false });
+    const ghAcc1 = ovAcc1.servers.find((s) => s.name === "github");
+    assert.equal(ghAcc1.accounts.length, 2);
+    assert.equal(ghAcc1.activeAccountName, "Work GitHub");
+    assert.equal(ghAcc1.instances.codex.headers.Authorization, "Bearer ghp_work_account_token_123");
+    // Overview account metadata never leaks raw secret values!
+    assert.equal(ghAcc1.accounts[0].headers, undefined);
+
+    await store.switchServerAccount("github", personalAcc.id);
+    const ovAcc2 = await store.buildOverview({ includeBackups: false });
+    const ghAcc2 = ovAcc2.servers.find((s) => s.name === "github");
+    assert.equal(ghAcc2.activeAccountName, "Personal GitHub");
+    assert.equal(ghAcc2.instances["claude-code"].headers.Authorization, "Bearer ghp_personal_account_token_999");
+    assert.equal(ghAcc2.instances.codex.headers.Authorization, "Bearer ghp_personal_account_token_999");
+
+    await store.deleteServerAccount("github", workAcc.id);
+    const ovAcc3 = await store.buildOverview({ includeBackups: false });
+    assert.equal(ovAcc3.servers.find((s) => s.name === "github").accounts.length, 1);
+  });
+});
+
+describe("Official MCP Registry search & Smart URL/Package/Repo resolver", () => {
+  afterEach(() => {
+    clearRegistryCache();
+  });
+
+  it("resolves direct remote URLs, scoped npm packages, PyPI links, and GitHub repos", () => {
+    const remote = resolveSmartInput("https://mcp.stripe.com/mcp");
+    assert.equal(remote.transport, "http");
+    assert.equal(remote.url, "https://mcp.stripe.com/mcp");
+    assert.equal(remote.id, "stripe");
+
+    const npmScoped = resolveSmartInput("@modelcontextprotocol/server-postgres");
+    assert.equal(npmScoped.transport, "stdio");
+    assert.equal(npmScoped.command, "npx");
+    assert.deepEqual(npmScoped.args, ["-y", "@modelcontextprotocol/server-postgres"]);
+
+    const npmUrl = resolveSmartInput("https://www.npmjs.com/package/@playwright/mcp");
+    assert.equal(npmUrl.command, "npx");
+    assert.equal(npmUrl.id, "playwright");
+    assert.deepEqual(npmUrl.args, ["-y", "@playwright/mcp"]);
+
+    const genericScoped = resolveSmartInput("@stripe/mcp");
+    assert.equal(genericScoped.id, "stripe");
+    assert.equal(genericScoped.name, "Stripe");
+
+    const pypiUrl = resolveSmartInput("https://pypi.org/project/mcp-server-fetch/");
+    assert.equal(pypiUrl.command, "uvx");
+    assert.deepEqual(pypiUrl.args, ["mcp-server-fetch"]);
+
+    const ghUrl = resolveSmartInput("https://github.com/crystaldba/postgres-mcp");
+    assert.equal(ghUrl.command, "uvx");
+    assert.equal(ghUrl.id, "postgres");
+  });
+
+  it("normalizes official MCP Registry v0 responses and caches search results", async () => {
+    const mockEntry = normalizeRegistryEntry({
+      server: {
+        name: "io.github.acme/mcp-server-weather",
+        title: "Weather MCP",
+        description: "Live weather forecasts",
+        version: "1.0.2",
+        packages: [
+          {
+            registryType: "npm",
+            identifier: "@acme/mcp-server-weather",
+            environmentVariables: [{ name: "WEATHER_API_KEY" }],
+          },
+        ],
+      },
+    });
+    assert.equal(mockEntry.id, "weather");
+    assert.equal(mockEntry.command, "npx");
+    assert.deepEqual(mockEntry.args, ["-y", "@acme/mcp-server-weather"]);
+    assert.equal(mockEntry.env.WEATHER_API_KEY, "${WEATHER_API_KEY}");
+
+    let calls = 0;
+    const fakeFetch = async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          servers: [
+            {
+              server: {
+                name: "com.stripe/mcp",
+                title: "Stripe",
+                description: "Stripe payments MCP (OAuth)",
+                remotes: [{ type: "streamable-http", url: "https://mcp.stripe.com/mcp" }],
+              },
+            },
+          ],
+        }),
+      };
+    };
+
+    const res1 = await searchMcpRegistry("stripe", { fetchImpl: fakeFetch });
+    assert.equal(res1.offline, false);
+    assert.equal(res1.cached, false);
+    assert.equal(res1.items.length, 1);
+    assert.equal(res1.items[0].url, "https://mcp.stripe.com/mcp");
+    assert.equal(calls, 1);
+
+    // Second identical search hits TTL cache
+    const res2 = await searchMcpRegistry("stripe", { fetchImpl: fakeFetch });
+    assert.equal(res2.cached, true);
+    assert.equal(calls, 1);
+  });
 });
 
 describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch probe", () => {
@@ -545,6 +760,8 @@ describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch pr
       assert.equal(okRes.cached, false);
       assert.equal(okRes.serverInfo.name, "mock-mcp");
       assert.equal(okRes.toolCount, 1);
+      assert.ok(okRes.estimatedTokens > 0);
+      assert.ok(okRes.tools[0].estimatedTokens > 0);
       assert.equal(okRes.tools[0].inputSchema.fields[0].name, "query");
       assert.equal(okRes.tools[0].inputSchema.fields[0].required, true);
 
@@ -607,6 +824,12 @@ describe("Command tokenizer, JSON import, MCP HTTP live probe & bounded batch pr
         "server.previewNative",
         "server.upsert",
         "server.sync",
+        "server.setPaused",
+        "server.setDisabledTools",
+        "server.saveAccount",
+        "server.switchAccount",
+        "server.deleteAccount",
+        "registry.search",
         "server.batchToggle",
         "server.batchSync",
         "server.batchDelete",

@@ -2,8 +2,12 @@
 
 > 在 **CodexHost Web 左侧边栏**与 **Codex Desktop 插件页面**中，以极低延迟与极简操作统一管理 **Claude Code · Antigravity (`agy`) · OpenCode · Codex** 四个 Harness 的 MCP 服务、工具调试与原生插件。
 
-## 核心能力（v1.2.0）
+## 核心能力（v1.3.0）
 
+- **单工具粒度禁用 & 上下文 Token 节省**：展开远程 MCP 工具面板后可逐个启用/禁用单个工具，自动按四端原生格式写入（Codex `disabled_tools`、Claude Code `permissions.deny`、OpenCode `tools`、Antigravity `excludeTools`），实时估算每轮节省的 Token。
+- **官方 MCP Registry 在线发现 + 智能粘贴解析**：除内置精选预设外，直接支持搜索 `registry.modelcontextprotocol.io` 官方社区目录；粘贴任意远程 MCP URL、`@scope/pkg`、npm/PyPI 链接或 GitHub `owner/repo` 即可自动解析并预填接入。
+- **多账号 / 多环境凭据一键切换**：支持为同一个 MCP 保存多套命名凭据档案（如工作号 / 个人号），一键切换同步覆盖四端配置。
+- **全局一键暂停 / 原样恢复**：暂停服务时自动记住原勾选的客户端集合，随时一键按原样还原；并支持 Codex `startup_timeout_sec` / `tool_timeout_sec` 超时配置与 `${ENV_VAR}` 缺失环境变量即时告警。
 - **现代应用卡片画廊 UI（Bento App Gallery）**：3 列应用卡片画廊呈现每个 MCP 能力（确定性双色字母圆角徽标、状态胶囊、四端迷你停靠栏、末位预设快速接入卡）；点击「探测 / 调试 / 授权」自动全宽展开工具与 OAuth 工作区，独立调校亮/暗双主题并完整适配 390px 移动端。
 - **Web 左侧边栏直达 + Desktop 跨端页面**：通过 `web` 入口调用 `api.panels.register({ placement: "main" })` 挂载到 CH Web 一级侧边栏「MCP 管理」，同时通过 `page` 入口无缝支持 Codex Desktop（设置 → 插件页面）。
 - **极致性能工程**：
@@ -24,10 +28,11 @@
 # 运行单元测试与并发/性能验证
 npm test
 
-# 同步样式、执行静态安全与契约校验、生成发布包 dist/mcp-hub-1.2.0.zip
+# 同步样式、执行静态安全与契约校验、生成发布包 dist/mcp-hub-1.3.0.zip
 npm run pack
 ```
 
-## 自动发布流（GitHub Actions）
+## 更新日志与自动发布流（GitHub Actions）
 
-已内置 `.github/workflows/release.yml`：更新 `manifest.json` 与 `package.json` 版本号并推送对应 Tag（如 `git tag v1.2.0 && git push origin v1.2.0`），CI 将自动执行单测、打包与静态安全审计，并发布携带 ZIP + 图标 + 双主题预览图的 GitHub Release。
+- 完整版本更新说明见 [CHANGELOG.md](./CHANGELOG.md)。
+- 已内置 `.github/workflows/release.yml`：每次发布前需同步更新 `manifest.json`、`package.json` 及 `CHANGELOG.md` 对应版本章节，再推送 Tag（如 `git tag v1.3.0 && git push origin v1.3.0`）。CI 将自动校验版本与更新说明、执行单测与静态安全审计，并从 `CHANGELOG.md` 提取该版本说明发布 GitHub Release（附带 ZIP + 图标 + 双主题预览图）。

@@ -1,13 +1,15 @@
 /**
- * CodexHost Unified Extension Backend (`mcp-hub` v1.2.0).
+ * CodexHost Unified Extension Backend (`mcp-hub` v1.3.0).
  *
  * Runs as a single Host-managed Node.js process shared by Codex Desktop and CH Web.
  * Pure Node.js standard library implementation with:
  * - Projected stat-cached config reads + overview memoization
  * - Lightweight fs.watch + revision-based 0-I/O `overview.poll`
- * - Slim mutation responses (lazy backups + one-time presets delivery)
+ * - Per-tool granular disable across all 4 harnesses + context token estimation
+ * - Global pause/resume with harness memory & multi-account credential profiles
+ * - Live Official MCP Registry search + smart URL/npm/PyPI/GitHub resolver
  * - Live Streamable HTTP tool schema discovery & interactive `tools/call` runner
- * - Secret-redacted safe JSON export & batch operations
+ * - Missing `${ENV_VAR}` diagnostics, secret-redacted export, timeouts & batch operations
  */
 
 import { HARNESS_IDS, McpConfigStore, renderNativePreviews } from "./adapters.mjs";
@@ -20,6 +22,7 @@ import {
   probeAllServers,
   probeMcpServer,
 } from "./probe.mjs";
+import { clearRegistryCache, searchMcpRegistry } from "./registry.mjs";
 
 export async function activate(ctx) {
   const oauth = new McpOAuthManager();
@@ -90,6 +93,59 @@ export async function activate(ctx) {
     }
     await store.toggleServer(params.name, params.harnessId, params.enabled);
     return { overview: await buildPayload() };
+  });
+
+  ctx.handle("server.setPaused", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid pause payload");
+    }
+    const result = await store.setServerPaused(params.name, Boolean(params.paused));
+    return { ...result, overview: await buildPayload() };
+  });
+
+  ctx.handle("server.setDisabledTools", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid disabledTools payload");
+    }
+    const result = await store.setDisabledTools(params.name, params.disabledTools ?? []);
+    return { ...result, overview: await buildPayload() };
+  });
+
+  ctx.handle("server.saveAccount", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid saveAccount payload");
+    }
+    const result = await store.saveServerAccount({
+      serverName: params.serverName,
+      id: params.id ?? null,
+      name: params.name,
+      headers: params.headers ?? null,
+      env: params.env ?? null,
+      activate: params.activate !== false,
+    });
+    return { ...result, overview: await buildPayload() };
+  });
+
+  ctx.handle("server.switchAccount", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid switchAccount payload");
+    }
+    const result = await store.switchServerAccount(params.serverName, params.accountId);
+    return { ...result, overview: await buildPayload() };
+  });
+
+  ctx.handle("server.deleteAccount", async (params) => {
+    if (!params || typeof params !== "object") {
+      throw new Error("Invalid deleteAccount payload");
+    }
+    const result = await store.deleteServerAccount(params.serverName, params.accountId);
+    return { ...result, overview: await buildPayload() };
+  });
+
+  ctx.handle("registry.search", async (params) => {
+    const query = typeof params?.query === "string" ? params.query : "";
+    const limit = Number.isFinite(Number(params?.limit)) ? Number(params.limit) : 20;
+    return searchMcpRegistry(query, { limit });
   });
 
   ctx.handle("server.sync", async (params) => {
@@ -281,5 +337,6 @@ export async function activate(ctx) {
     store.dispose();
     oauth.dispose();
     clearProbeCache();
+    clearRegistryCache();
   };
 }

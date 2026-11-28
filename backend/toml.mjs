@@ -352,6 +352,7 @@ export function renderCodexMcpServerBlock(name, rawEntry, eol = "\n") {
     "args",
     "url",
     "enabled",
+    "disabled_tools",
     "bearer_token_env_var",
     "env_vars",
     "startup_timeout_sec",

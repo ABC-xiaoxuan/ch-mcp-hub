@@ -100,6 +100,17 @@ const SVG_PATHS = {
     '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" />',
     '<path d="M14 3v5h5" />',
   ],
+  pause: [
+    '<rect x="6" y="5" width="4" height="14" rx="1" />',
+    '<rect x="14" y="5" width="4" height="14" rx="1" />',
+  ],
+  user: [
+    '<circle cx="12" cy="8" r="4" />',
+    '<path d="M5 20a7 7 0 0 1 14 0" />',
+  ],
+  cloud: [
+    '<path d="M17.5 19H7a4.5 4.5 0 0 1-.8-8.9A5.5 5.5 0 0 1 17 8.5a4 4 0 0 1 .5 10.5Z" />',
+  ],
 };
 
 export function iconSvg(name, size = 15) {

@@ -212,7 +212,7 @@ async function probeRemoteServer(server) {
         params: {
           protocolVersion: MCP_PROTOCOL_VERSION,
           capabilities: {},
-          clientInfo: { name: "codexhost-mcp-hub", version: "1.1.0" },
+          clientInfo: { name: "codexhost-mcp-hub", version: "1.3.0" },
         },
       }),
       signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
@@ -282,11 +282,20 @@ async function probeRemoteServer(server) {
           toolsRes.headers.get("content-type"),
         );
         if (Array.isArray(toolsRpc?.result?.tools)) {
-          tools = toolsRpc.result.tools.slice(0, 120).map((t) => ({
-            name: String(t.name ?? ""),
-            description: typeof t.description === "string" ? t.description.slice(0, 240) : "",
-            inputSchema: summarizeInputSchema(t.inputSchema),
-          }));
+          tools = toolsRpc.result.tools.slice(0, 120).map((t) => {
+            const rawChars = JSON.stringify({
+              name: t.name ?? "",
+              description: t.description ?? "",
+              inputSchema: t.inputSchema ?? {},
+            }).length;
+            const estimatedTokens = Math.max(24, Math.ceil(rawChars / 3.8));
+            return {
+              name: String(t.name ?? ""),
+              description: typeof t.description === "string" ? t.description.slice(0, 240) : "",
+              inputSchema: summarizeInputSchema(t.inputSchema),
+              estimatedTokens,
+            };
+          });
         }
       }
     } catch {
@@ -306,6 +315,7 @@ async function probeRemoteServer(server) {
         : null,
       tools,
       toolCount: tools.length,
+      estimatedTokens: tools.reduce((sum, item) => sum + (item.estimatedTokens ?? 0), 0),
     };
   } catch (error) {
     return {
